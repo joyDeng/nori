@@ -144,10 +144,8 @@ static void render(Scene *scene, const std::string &filename) {
     size_t lastdot = outputName.find_last_of(".");
     if (lastdot != std::string::npos)
         outputName.erase(lastdot, std::string::npos);
-
     /* Save using the OpenEXR format */
     bitmap->saveEXR(outputName);
-
     /* Save tonemapped (sRGB) output using the PNG format */
     bitmap->savePNG(outputName);
 }
@@ -157,9 +155,7 @@ int main(int argc, char **argv) {
         cerr << "Syntax: " << argv[0] << " <scene.xml>" << endl;
         return -1;
     }
-
     std::string sceneName = "";
-
     for (int i = 1; i < argc; ++i) {
         std::string token(argv[i]);
         if (token == "-t" || token == "--threads") {
@@ -173,16 +169,12 @@ int main(int argc, char **argv) {
                 cerr << "\"--threads\" argument expects a positive integer following it." << endl;
                 return -1;
             }
-
             continue;
         }
-
         filesystem::path path(argv[i]);
-
         try {
             if (path.extension() == "xml") {
                 sceneName = argv[i];
-
                 /* Add the parent directory of the scene file to the
                    file resolver. That way, the XML file can reference
                    resources (OBJ files, textures) using relative paths */
@@ -206,17 +198,14 @@ int main(int argc, char **argv) {
             return -1;
         }
     }
-
     if (threadCount < 0) {
         threadCount = tbb::task_scheduler_init::automatic;
     }
-
     if (sceneName != "") {
             std::unique_ptr<NoriObject> root(loadFromXML(sceneName));
             /* When the XML root object is a scene, start rendering it .. */
             if (root->getClassType() == NoriObject::EScene)
                 render(static_cast<Scene *>(root.get()), sceneName);
     }
-
     return 0;
 }

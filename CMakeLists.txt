@@ -1,7 +1,14 @@
-cmake_minimum_required (VERSION 3.2)
-project(nori)
+cmake_minimum_required (VERSION 3.14)
+project(nori LANGUAGES CUDA CXX)
 
 add_subdirectory(ext ext_build)
+
+
+#find_package(CUDA)
+#enable_language(CUDA)
+
+include(CheckLanguage)
+check_language(CUDA)
 
 include_directories(
   # Nori include files
@@ -103,6 +110,36 @@ add_executable(warptest
   src/common.cpp
 )
 
+add_executable(pathgraph
+  include/nori/shadingPoint.h
+  include/nori/pathgraph.h
+  include/nori/warp.h
+  include/nori/bitmap.h
+  src/bitmap.cpp
+  src/warp.cpp
+  src/common.cpp
+  src/pathgraph.cpp
+  src/visual.cpp
+  src/pbsdf.cu
+  )
+
+add_executable(pg
+  include/nori/shadingPoint.h
+  include/nori/pathgraph.h
+  include/nori/warp.h
+  include/nori/bitmap.h
+  src/bitmap.cpp
+  src/warp.cpp
+  src/common.cpp
+  src/pathgraph.cpp
+  src/cluster.cpp
+  src/pbsdf.cu
+  )
+
+add_executable(test
+  src/test.cu
+  )
+
 if (WIN32)
   target_link_libraries(nori tbb_static pugixml IlmImf nanogui ${NANOGUI_EXTRA_LIBS} zlibstatic)
 else()
@@ -110,6 +147,9 @@ else()
 endif()
 
 target_link_libraries(warptest tbb_static nanogui ${NANOGUI_EXTRA_LIBS})
+target_link_libraries(pathgraph tbb_static IlmImf nanogui ${NANOGUI_EXTRA_LIBS})
+target_link_libraries(pg tbb_static IlmImf nanogui ${NANOGUI_EXTRA_LIBS})
+#target_link_libraries(test tbb_static nanogui IlmImf ${NANOGUI_EXTRA_LIBS})
 
 # Force colored output for the ninja generator
 if (CMAKE_GENERATOR STREQUAL "Ninja")
@@ -122,7 +162,23 @@ if (CMAKE_GENERATOR STREQUAL "Ninja")
   endif()
 endif()
 
+#set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
+
+#set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libstdc++ -lc++abi")
+
 target_compile_features(warptest PRIVATE cxx_std_17)
 target_compile_features(nori PRIVATE cxx_std_17)
+target_compile_features(pathgraph PRIVATE cxx_std_17 cuda_std_11)
+target_compile_features(pg PRIVATE cxx_std_17 cuda_std_11)
+#target_compile_features(test PRIVATE cxx_std_17 cuda_std_11)
+SET_TARGET_PROPERTIES(pathgraph PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+SET_TARGET_PROPERTIES(pathgraph PROPERTIES CUDA_ARCHITECTURES 75)
+
+SET_TARGET_PROPERTIES(pg PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+SET_TARGET_PROPERTIES(pg PROPERTIES CUDA_ARCHITECTURES 75)
+
+
+SET_TARGET_PROPERTIES(test PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+SET_TARGET_PROPERTIES(test PROPERTIES CUDA_ARCHITECTURES 75)
 
 # vim: set et ts=2 sw=2 ft=cmake nospell:
