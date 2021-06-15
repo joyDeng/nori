@@ -39,14 +39,14 @@ bool PathGraph::loadShadingPoints(std::string foldername){
 
 void PathGraph::computeDimensions(AABBINFO aabb, const int N){
     Point3f extents = aabb.extents;
-    Point3f ratio = extents / extents[aabb.shortAxis];
+    Point3f ratio = extents / extents[aabb.longAxis];
     float dim = pow(N, 1.0 / 3.0)+1.0;
     Point3f dimensions = ratio * dim + Point3f(1.0f);
     int grid_resolution[3] = {(int)dimensions[0], (int)dimensions[1], (int)dimensions[2]};
     memcpy(m_sps.my_dim, grid_resolution, 3 *sizeof(int));
-    printf("resolution of the hash grid is [%d x %d x %d]", grid_resolution[0], grid_resolution[1], grid_resolution[2]);
-    printf("size of the hash grid is [%.3f x %.3f x %.3f]", extents[0], extents[1], extents[2]);
-    printf("ratio of the hash grid is [%.3f x %.3f x %.3f]", ratio[0], ratio[1], ratio[2]);
+    printf("\n resolution of the hash grid is [%d x %d x %d]", grid_resolution[0], grid_resolution[1], grid_resolution[2]);
+    printf("\n size of the hash grid is [%.3f x %.3f x %.3f]", extents[0], extents[1], extents[2]);
+    printf("\n ratio of the hash grid is [%.3f x %.3f x %.3f]", ratio[0], ratio[1], ratio[2]);
 }
 
 bool PathGraph::loadPaths(std::string foldername){
@@ -85,6 +85,43 @@ bool PathGraph::loadPaths(std::string foldername){
     return ret;
 }
 
+bool PathGraph::loadNeighbors(std::string foldername){
+    bool ret = true;
+    std::string filename = foldername + "neighbors.bin";
+    fstream nfile;
+    nfile.open(filename.c_str(), ios::in | ios::binary);
+
+    filename = foldername + "_clusters.bin";
+    fstream cfile;
+    cfile.open(filename.c_str(), ios::in | ios::binary);
+
+    if(nfile.is_open() && cfile.is_open()){
+        nfile.seekg(0);
+        cfile.seekg(0);
+        int nump;
+        int nc;
+        nfile.read((char *)&nump, sizeof(int));
+        cfile.read((char *)&nc, sizeof(int));
+        m_sps.allocateNeighrbos(nc, nump);
+        m_sps.numberOfPoints = nump;
+        std::cout<<"[loadNeighbors] numlight =  "<<nump<<"num shadingpoint: = "<< m_spCount<<std::endl;
+        m_sps.h_clusters = (int*) malloc(sizeof(int) * nump);
+        nfile.read((char *)m_sps.h_clusters, sizeof(int) * nump);
+        nfile.close();
+        ret &= true;
+
+        std::cout<<"[loadNeighbors] numlight =  "<<nc<<"num shadingpoint: = "<< m_spCount<<std::endl;
+        m_sps.numberOfClusters = nc;
+        cfile.read((char *)m_sps.h_clusters_offset, sizeof(int) * nc);
+        cfile.close();
+        ret &= true;
+    }else{
+        std::cout<<"[loadNeighbors] Failed to open file: "<<filename<<std::endl;
+        ret = false;
+    }
+    return ret;
+}
+
 bool PathGraph::loadLightPoints(std::string foldername){
     bool ret = true;
     std::string filename = foldername + "_light.bin";
@@ -105,7 +142,6 @@ bool PathGraph::loadLightPoints(std::string foldername){
         std::cout<<"[loadGraph] Failed to open file: "<<filename<<std::endl;
         ret = false;
     }
-
     return ret;
 }
 
@@ -120,7 +156,7 @@ bool PathGraph::loadAABB(std::string foldername){
         aabbfile.read((char *)&m_aabb, sizeof(AABBINFO));
         memcpy(m_sps.my_minb, &m_aabb.min, 3 * sizeof(float));
         memcpy(m_sps.my_maxb, &m_aabb.max, 3 * sizeof(float));
-        std::cout<<"[loadGraph] aabb =  "<<m_aabb.min<<"num shadingpoint: = "<< m_aabb.max<<std::endl;
+        std::cout<<"[loadGraph] max =  "<<m_aabb.min<<" \n min = "<< m_aabb.max<<std::endl;
         aabbfile.close();
         ret &= true;
     }else{

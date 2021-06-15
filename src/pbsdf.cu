@@ -8,8 +8,8 @@
 #include <thrust/sequence.h>
 #include <thrust/device_ptr.h>
 
-#define THREADDIM 256
-#define ETA 1.5f
+#define THREADDIM 512
+// #define ETA 1.5f
 // #define MAXNEIGHBOR 100
 #define HASH_LITTLE_ENDIAN 1
 
@@ -39,6 +39,9 @@ __constant__ int d_table_size;
 __constant__ int d_last_cluster_size;
 __constant__ int d_individual;
 __constant__ size_t d_pitch_n;
+__constant__ int d_num_clusters_point;
+__constant__ float d_min_dist;
+__device__ int d_debug_cluster_idx;
 
 
 void CUDAErrorLog(int e, std::string ctr);
@@ -346,7 +349,7 @@ __device__ float distreval(float cosh, float roughness){
     return result;
 }
 
-__device__ float fresnelDielectricExt(float cosThetaI_){
+__device__ float fresnelDielectricExt(float cosThetaI_, float ETA){
     /* Using Snell's law, calculate the squared sine of the
        angle between the normal and the transmitted ray */
     float scale = (cosThetaI_ > 0.0) ? 1.0 / ETA : ETA;
@@ -388,7 +391,7 @@ __device__ float distrpdf(const float dotWoShN, const float dotWoH, const float 
 }
 
 /*bsdf evaluation given shading point and incoming light direction */
-__device__ void bsdfeval_device(const SPoint sp, const float *wi, float *bsdf){
+__device__ void bsdfeval_device(const SPoint sp, const float *wi, float *bsdf, bool t=false){
     
     float dotWiShN = dot(wi, sp.shN);
     float dotWigeoN = dot(wi, sp.geoN);
@@ -403,6 +406,7 @@ __device__ void bsdfeval_device(const SPoint sp, const float *wi, float *bsdf){
 
     /* compute specular part */
     if(sp.bsdf_type == 'd'){
+        
         bsdf[0] = diffuse[0];
         bsdf[1] = diffuse[1];
         bsdf[2] = diffuse[2];
@@ -415,12 +419,23 @@ __device__ void bsdfeval_device(const SPoint sp, const float *wi, float *bsdf){
 
         float dotWoH = dot(sp.wo, wh);
         float dotWiH = dot(wi, wh);
-        float F = fresnelDielectricExt(dotWoH);
+        float F = fresnelDielectricExt(dotWoH, 1.5);
         float G = smithG1(dotWoH, dotWoShN, sp.roughness) * smithG1(dotWiH, dotWiShN, sp.roughness);
 
         float specularconst = F * G * D / (4.0f * dotWoShN);
         float specular[3];
         mul3fand1f(sp.specular, specularconst, specular);
+
+        /*energy conservation fix*/
+        // float dotWoShN = dot(sp.shN, sp.wo);
+        float T1221 = (1.0 - fresnelDielectricExt(dotWoShN, 1.5)) * (1.0 - fresnelDielectricExt(dotWiShN, 1.5));
+        mul3fand1f(diffuse, T1221, diffuse);
+        if(t){
+            printf("T1221 = %.3f, F = %.5f, D = %.5f, G = %.5f, diffuse = [%.4f, %.4f, %.4f], cosh = %.9f\n", T1221, F, D, G, diffuse[0], diffuse[1], diffuse[2], dotWhShN);
+            printf("wh = [%.4f, %.4f, %.4f], shN = [%.4f, %.4f, %.4f]\n", wh[0], wh[1], wh[2], sp.shN[0], sp.shN[1], sp.shN[2]);
+            printf("wi = [%.4f, %.4f, %.4f], wo = [%.4f, %.4f, %.4f]\n", wi[0], wi[1], wi[2], sp.wo[0], sp.wo[1], sp.wo[2]);
+        }
+
         /*compute diffuse part*/
         add3f(diffuse, specular, bsdf);
     }
@@ -440,7 +455,7 @@ __device__ void pdf_device(const SPoint sp, const float *wi, float *pdf){
         // printf("is diffuse surface!");
         *pdf = diffuse;
     }else{
-        float pspecular = fresnelDielectricExt(dotWoShN);
+        float pspecular = fresnelDielectricExt(dotWoShN, 1.5);
         float pdiffuse = fmaxf(fmaxf(sp.diffuse[0], sp.diffuse[1]), sp.diffuse[2]);
 
         pspecular = pspecular / (pspecular + pdiffuse);
@@ -627,7 +642,7 @@ __device__ void findSmallest(float *dist, int *index, int low, int high){
     }
 }
 
-__device__ uint32_t hashmap(uint32_t idx){
+__device__ uint32_t hashbmap(uint32_t idx){
     return (idx *  5039 + 39916801) % d_table_size;
 }
 
@@ -640,12 +655,6 @@ __device__ void swap(int *a, int *b){
     int c = *a;
     *a = *b;
     *b = c;
-}
-
-__device__ void permutate(int *array, int N){
-    // for (int i = 0 ; i < N ; i++){
-    //     swap(array + i, array + k)
-    // }
 }
 
 __global__ void addEmitterToDirectLight(const LPoint *lps, val3f *direct_radiance){
@@ -691,10 +700,10 @@ __global__ void HashGridSize(const SPoint *sps, int *num_point_in_hashgrids){
 __global__ void HashTableSize(const SPoint *sps, const int *cu_clusters_idx, int *num_point_in_hashtable){
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if(idx >= d_num_clusters) return;
-    uint32_t cluster_idx = cu_clusters_idx[idx];
+    uint32_t spidx = cu_clusters_idx[idx];
     int3 xyzs = make_int3(0,0,0);
-    getKeys(sps[cluster_idx].pos, &xyzs);
-    uint32_t key = hashmap(getKey(xyzs));
+    getKeys(sps[spidx].pos, &xyzs);
+    uint32_t key = hashbmap(getKey(xyzs));
     atomicAdd(&num_point_in_hashtable[key], 1);
 }
 
@@ -724,21 +733,25 @@ __global__ void buildHash(const SPoint *sps, const int *offset, int *cu_num_in_g
     grids[offset_g + idx_in_grid].index = index;
 }
 
-__global__ void buildHashSub(const SPoint *sps, const int * cu_cluster_idx, const int *offset, int *cu_num_in_grid, GridEntry *cu_hash_table){
-    uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if(index >= d_num_clusters) return;
-    int spidx = cu_cluster_idx[index];
+__global__ void buildHashSub(const SPoint *sps, const int * cu_cluster_idx, const int *cu_hash_offset, int *cu_num_in_grid, GridEntry *cu_hash_table){
+    uint32_t Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(Index >= d_num_clusters) return;
+    int spidx = cu_cluster_idx[Index];
 
     SPoint sp = sps[spidx];
     int3 xyzs = make_int3(0,0,0);
     getKeys(sp.pos, &xyzs);
-    uint32_t key = hashmap(getKey(xyzs));
-    int offset_g = offset[key];
-    uint32_t idx_in_grid = atomicAdd(&cu_num_in_grid[key], 1);
-    cu_hash_table[offset_g + idx_in_grid].position[0] = sp.pos[0];
-    cu_hash_table[offset_g + idx_in_grid].position[1] = sp.pos[1];
-    cu_hash_table[offset_g + idx_in_grid].position[2] = sp.pos[2];
-    cu_hash_table[offset_g + idx_in_grid].index = index;
+    uint32_t key = hashbmap(getKey(xyzs));
+
+    int hash_offset = cu_hash_offset[key];
+    int idx_in_grid = atomicAdd(&cu_num_in_grid[key], 1);
+    // if (npingrid == 0)
+    //     printf("WARNING!!!!!!!!!!!!!!!!!!!!! idx_in_grid = %d, hash_offset = %d, spidx = %d", idx_in_grid, hash_offset, spidx);
+    // cu_hash_table[offset_g + idx_in_grid].position[0] = sp.pos[0];
+    // cu_hash_table[offset_g + idx_in_grid].position[1] = sp.pos[1];
+    // cu_hash_table[offset_g + idx_in_grid].position[2] = sp.pos[2];
+    copy3f(cu_hash_table[hash_offset + idx_in_grid].position, sp.pos);
+    cu_hash_table[hash_offset + idx_in_grid].index = Index;
 }
 
 __global__ void countClusters(int * cu_num_in_cell, int * cu_num_small_cluster, int K){
@@ -779,19 +792,19 @@ __global__ void SubdivideClusters(SPoint *cu_sps,
                                     int * cu_num_point_new_cluster, // length: sizeof new cluster
                                     const int * cu_num_small_clusters, // length size of old cluster
                                     const int newNumClusters){
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if(index >= d_sizeofsp) return;
+    int Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(Index >= d_sizeofsp) return;
 
-    SPoint sp = cu_sps[index];
+    SPoint sp = cu_sps[Index];
     int cluster_idx = sp.groupIdx;// old cluster idx;
     if (cluster_idx != -1){
         int pnum = getCellSize(cu_num_small_clusters, cluster_idx, d_num_clusters, newNumClusters);
         int cluster_offset = cu_clusters_old_offset[cluster_idx];
         int newgroupIdx = cu_num_small_clusters[cluster_idx];
 
-        cu_sps[index].groupIdx = newgroupIdx;
+        cu_sps[Index].groupIdx = newgroupIdx;
         if(pnum > 1){
-            float mindist = 65536.0;
+            float mindist = 262144.0;
             int minidx = 0;
             for(int i = 0 ; i < pnum; i++){
                 SPoint clusterpoint = cu_sps[cu_clusters[cluster_offset+i]];
@@ -801,35 +814,49 @@ __global__ void SubdivideClusters(SPoint *cu_sps,
                     minidx = i;
                 }
             }
-            cu_sps[index].groupIdx += minidx;
+            cu_sps[Index].groupIdx += minidx;
         }
-        atomicAdd(&cu_num_point_new_cluster[cu_sps[index].groupIdx], 1);
+        atomicAdd(&cu_num_point_new_cluster[cu_sps[Index].groupIdx], 1);
     }
+}
+
+__global__ void CheckClusters(const int *cu_neighbors_offset, int *cu_num_in_cell){
+    int Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(Index >= d_num_clusters) return;
+
+    int pnum = getCellSize(cu_neighbors_offset, Index, d_num_clusters, d_num_clusters_point);
+    int currentIdx = cu_num_in_cell[Index];
+    if (currentIdx != pnum)
+        printf("\n %d th currentIdx = %d, pnum = %d", Index, currentIdx, pnum);
 }
 
 
 __global__ void SaveClusters(SPoint *sps, const int * cu_neighbors_offset, int * cu_num_in_cell, int * cu_clusters){
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if(index >= d_sizeofsp) return;
+    int Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(Index >= d_sizeofsp) return;
 
-    SPoint sp = sps[index];
-    if(sp.groupIdx != -1){
-        int offset = cu_neighbors_offset[sp.groupIdx];
-        int currentIdx = atomicAdd(&cu_num_in_cell[sp.groupIdx], 1);
-        cu_clusters[offset + currentIdx] = index;
-    } else {
+    int cluster_idx = sps[Index].groupIdx;
+    if(cluster_idx != -1){
+        int offset = cu_neighbors_offset[cluster_idx];
+        // int pnum = getCellSize(cu_neighbors_offset, cluster_idx, d_num_clusters, d_num_clusters_point);
+        int currentIdx = atomicAdd(&cu_num_in_cell[cluster_idx], 1);
+        // if(currentIdx == pnum-1)
+            // printf("\n %d th currentIdx = %d, pnum = %d", Index, currentIdx, pnum);
+        cu_clusters[offset + currentIdx] = Index;
+    } 
+    // else {
         // deal with the point that didn't find any neighbors in 8 grids
-        int offset = cu_neighbors_offset[d_num_clusters-1] + d_last_cluster_size;
-        int currentIdx = atomicAdd(&cu_num_in_cell[d_num_clusters], 1);
-        cu_clusters[offset + currentIdx] = index;
-    }
+        // int offset = d_num_clusters_point;
+        // int currentIdx = atomicAdd(&cu_num_in_cell[d_num_clusters], 1);
+        // cu_clusters[offset + currentIdx] = Index;
+    // }
 }
 
-__global__ void Cluster(SPoint *sps, const int * cu_offset, const GridEntry * cu_hash_table, int *  cu_neighbors_sizes){
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if(index >= d_sizeofsp) return;
-    // compute hash table index
-    SPoint sp = sps[index];
+__global__ void Cluster(SPoint *sps, const int * cu_hash_offset, const GridEntry * cu_hash_table, int *  cu_neighbors_sizes){
+    int Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(Index >= d_sizeofsp) return;
+    // compute hash table Index
+    SPoint sp = sps[Index];
     
     /*find the 8 grid for searching*/
     int3 keys = make_int3(0,0,0);
@@ -840,25 +867,25 @@ __global__ void Cluster(SPoint *sps, const int * cu_offset, const GridEntry * cu
     int3 rtf = make_int3(min(d_params.dim.x-1, max(keys.x, keys.x + dirs.x)),min(d_params.dim.y-1, max(keys.y, keys.y + dirs.y)),min(d_params.dim.z-1, max(keys.z, keys.z + dirs.z)));
     makesureGrid(&lbb, &rtf);
 
-    float mindistance = 65536.0;
+    float mindistance = d_min_dist;
     int nearest_cluster_id = -1;
     for(int ix = lbb.x ; ix <= rtf.x ; ix++)
         for(int iy = lbb.y ; iy <= rtf.y ; iy++)
             for(int iz = lbb.z ; iz <= rtf.z ; iz++){
-                uint32_t tempkey = hashmap(getKey(make_int3(ix, iy, iz)));
-                int offset = cu_offset[tempkey];
-                int pnum = getCellSize(cu_offset, tempkey, d_table_size, d_num_clusters);
+                uint32_t tempkey = hashbmap(getKey(make_int3(ix, iy, iz)));
+                int offset = cu_hash_offset[tempkey];
+                int pnum = getCellSize(cu_hash_offset, tempkey, d_table_size, d_num_clusters);
                 for (int i = 0 ; i < pnum; i++){
                     GridEntry G = cu_hash_table[offset + i];
                     float dist = dev_distance(G.position, sp.pos);
-                    if (dist < mindistance){
+                    if (dist <= mindistance){
                         mindistance = dist;
                         nearest_cluster_id = G.index;
                     }
                 }
             }
     
-    sps[index].groupIdx = nearest_cluster_id;
+    sps[Index].groupIdx = nearest_cluster_id;
     if (nearest_cluster_id != -1)
         atomicAdd(&cu_neighbors_sizes[nearest_cluster_id], 1);
 }
@@ -870,7 +897,7 @@ __global__ void CountNoneZeroElements(const SPoint *cu_sps, const int *cu_offset
     SPoint sp = cu_sps[index];
     int clusterIdx = sp.groupIdx;
     if(clusterIdx != -1){
-        cu_numberofNeighbor[index] = getCellSize(cu_offset, sp.groupIdx, d_num_clusters, d_sizeofsp-d_individual);
+        cu_numberofNeighbor[index] = getCellSize(cu_offset, sp.groupIdx, d_num_clusters, d_num_clusters_point);
     }else{
         cu_numberofNeighbor[index] = 1;
     }
@@ -883,11 +910,12 @@ __global__ void computeNoneZeroElements(const SPoint *sps,const int *cu_clusters
     SPoint sp = sps[index];
     int cluster_idx = sp.groupIdx;
     size_t my_element_offset = cu_element_offset[index];
-    if (cluster_idx != -1){
-        if (pdfmarginal[index] > 0.0 && sp.nidx > 0){
-            int point_num_in_cluster = getCellSize(cu_cluster_offset, cluster_idx, d_num_clusters, d_sizeofsp - d_individual);
+    if (pdfmarginal[index] > 0.0 && sp.nidx > 0 && sp.rrpdf > 1e-7f){
+        float inv_pdfmarginal = 1.0 / pdfmarginal[index];
+        if (cluster_idx != -1){
+            int point_num_in_cluster = getCellSize(cu_cluster_offset, cluster_idx, d_num_clusters, d_num_clusters_point);
             int my_cluster_offset = cu_cluster_offset[cluster_idx];
-            float inv_pdfmarginal = 1.0 / pdfmarginal[index];
+            
             for ( int i = 0 ; i < point_num_in_cluster ; i++){
                 int idx = cu_clusters[i + my_cluster_offset];
                 SPoint spo = sps[idx];
@@ -895,12 +923,11 @@ __global__ void computeNoneZeroElements(const SPoint *sps,const int *cu_clusters
                 bsdfeval_device(spo, sp.wi, bsdf);
                 mul3fand1f(bsdf,  inv_pdfmarginal, cu_matrix_elements[my_element_offset+i].value);
             }
+        }else{
+            float bsdf[3] = {0.0};
+            bsdfeval_device(sp, sp.wi, bsdf);
+            mul3fand1f(bsdf,  inv_pdfmarginal, cu_matrix_elements[my_element_offset].value);
         }
-    }else{
-        float bsdf[3] = {0.0};
-        bsdfeval_device(sp, sp.wi, bsdf);
-        mul3fand1f(bsdf,  1.0, cu_matrix_elements[my_element_offset].value);
-        return;
     }   
 
 }
@@ -1065,19 +1092,20 @@ __global__ void allGPUClusterPdfMarginal(const SPoint *sps, const int *clusters,
     int cluster_idx = sp.groupIdx;
     if (sp.groupIdx != -1){
         int offset = cluster_offsets[cluster_idx];
-        int point_num_in_cluster = getCellSize(cluster_offsets, sp.groupIdx, d_num_clusters, d_sizeofsp - d_individual);
+        int point_num_in_cluster = getCellSize(cluster_offsets, cluster_idx, d_num_clusters, d_num_clusters_point);
         float pdfm = 0.0;
         for ( int i = 0 ; i < point_num_in_cluster ; i++){
-                int idx = clusters[i + offset];
-                SPoint spo = sps[idx];
-                float pdf = 0.0;
-                pdf_device(spo, sp.wi, &pdf);
-                pdfm += pdf * sp.rrpdf;
+            SPoint spo = sps[clusters[offset+i]];
+            if(spo.nidx == Index) continue;
+            float pdf = 0.0;
+            pdf_device(spo, sp.wi, &pdf);
+            pdfm += (pdf * spo.rrpdf);
         }
         pdfmarginal[Index] = pdfm;
     }else{
-        pdfmarginal[Index] = sps[Index].pdf * sp.rrpdf;
-        return;
+        float pdf = 0.0;
+        pdf_device(sp, sp.wi, &pdf);
+        pdfmarginal[Index] = pdf * sp.rrpdf;
     }
 }
 
@@ -1090,18 +1118,25 @@ __global__ void MX(const SPoint *sps, const int * cu_clusters, const val3f * cu_
     int cluster_idx = sp.groupIdx;
     size_t my_element_offset = cu_element_offset[Index];
     if(sp.nidx > 0){
-        if (cluster_idx != -1 ){
-                int point_num_in_cluster = getCellSize(cu_cluster_offset, cluster_idx, d_num_clusters, d_sizeofsp - d_individual);
-                int cluster_offsets = cu_cluster_offset[cluster_idx];
-                for ( int i = 0 ; i < point_num_in_cluster ; i++){
-                    float rad[3] = {0.0f};
-                    size_t edx = my_element_offset+i;
-                    int rdx = cu_clusters[cluster_offsets+i];
-                    mul3fand3f(cu_elements[edx].value, cu_tempRadiance[Index+1].value, rad);
-                    atomicAdd(cu_radiance[rdx].value, rad[0]);
-                    atomicAdd(cu_radiance[rdx].value+1, rad[1]);
-                    atomicAdd(cu_radiance[rdx].value+2, rad[2]);
+        if (cluster_idx != -1){
+            int point_num_in_cluster = getCellSize(cu_cluster_offset, cluster_idx, d_num_clusters, d_num_clusters_point);
+            int cluster_offsets = cu_cluster_offset[cluster_idx];
+            for ( int i = 0 ; i < point_num_in_cluster ; i++){
+                float rad[3] = {0.0f};
+                size_t edx = my_element_offset+i;
+                int rdx = cu_clusters[cluster_offsets+i];
+                mul3fand3f(cu_elements[edx].value, cu_tempRadiance[Index+1].value, rad);
+                atomicAdd(cu_radiance[rdx].value, rad[0]);
+                atomicAdd(cu_radiance[rdx].value+1, rad[1]);
+                atomicAdd(cu_radiance[rdx].value+2, rad[2]);
+                if(isnan(rad[0]) || isnan(rad[1]) || isnan(rad[2])){
+                    printf("\n \n ISNAN*****************rad = [%.4f, %.4f, %.4f], incoming = [%.4f, %.4f, %.4f], ", rad[0], rad[1], rad[2], cu_tempRadiance[Index+1].value[0], cu_tempRadiance[Index+1].value[1], cu_tempRadiance[Index+1].value[2]);
                 }
+                // if (rdx == 2978795)
+                //     printf("weight %d is [%.4f, %.4f, %.4f], rad is [%.4f, %.4f, %.4f]\n", i,
+                //         cu_elements[edx].value[0], cu_elements[edx].value[1], cu_elements[edx].value[2],
+                //         cu_tempRadiance[Index+1].value[0], cu_tempRadiance[Index+1].value[1], cu_tempRadiance[Index+1].value[2]);
+            }
             
         }else{
             float rad[3] = {0.0f};
@@ -1109,6 +1144,10 @@ __global__ void MX(const SPoint *sps, const int * cu_clusters, const val3f * cu_
             atomicAdd(cu_radiance[Index].value, rad[0]);
             atomicAdd(cu_radiance[Index].value+1, rad[1]);
             atomicAdd(cu_radiance[Index].value+2, rad[2]);
+            if (Index == 2978795)
+                printf("weight %d is [%.4f, %.4f, %.4f], rad is [%.4f, %.4f, %.4f]", 1,
+                    cu_elements[my_element_offset].value[0], cu_elements[my_element_offset].value[1], cu_elements[my_element_offset].value[2],
+                    cu_tempRadiance[Index+1].value[0], cu_tempRadiance[Index+1].value[1], cu_tempRadiance[Index+1].value[2]);
             return;
         }   
     } 
@@ -1121,13 +1160,14 @@ __global__ void allGPUClusterScatterRadiance(const SPoint *sps, const float *pdf
     /* get index of my cluster*/
     int cluster_idx = sp.groupIdx;
     /* check whether this point belong to any cluster, if not do nothing */
-    if (cluster_idx != -1){
-        if (pdfmarginal[Index] > 0.0 && sp.nidx > 0){
-            int point_num_in_cluster = getCellSize(cu_cluster_offset, cluster_idx, d_num_clusters, d_sizeofsp - d_individual);
+    if (pdfmarginal[Index] > 0.0 && sp.nidx > 0 && sp.rrpdf > 1e-7f){
+        float inv_pdfmarginal = 1.0 / pdfmarginal[Index];
+        if (cluster_idx != -1){
+            int point_num_in_cluster = getCellSize(cu_cluster_offset, cluster_idx, d_num_clusters, d_num_clusters_point);
             int my_cluster_offset = cu_cluster_offset[cluster_idx];
-            float inv_pdfmarginal = 1.0 / pdfmarginal[Index];
             for ( int i = 0 ; i < point_num_in_cluster ; i++){
                 int idx = clusters[i + my_cluster_offset];
+                if(idx == Index+1) continue;
                 SPoint spo = sps[idx];
                 float bsdf[3] = {0.0};
                 bsdfeval_device(spo, sp.wi, bsdf);
@@ -1139,10 +1179,13 @@ __global__ void allGPUClusterScatterRadiance(const SPoint *sps, const float *pdf
                 atomicAdd(radiance[idx].value+1, rad[1]);
                 atomicAdd(radiance[idx].value+2, rad[2]);
             }
+        }else{
+            float bsdf[3] = {0.0};
+            bsdfeval_device(sp, sp.wi, bsdf);
+            float rad[3] = {0.0f};
+            mul3fand3f(bsdf, tempradiance[Index+1].value, rad);
+            mul3fand1f(rad,  inv_pdfmarginal, radiance[Index].value);
         }
-    }else{
-        sub3f(sp.eLi, sp.eLd, radiance[Index].value);
-        return;
     }    
 }
 
@@ -1303,15 +1346,28 @@ __global__ void lastRun(const SPoint *sps, const val3f *temp_rad, val3f *radianc
     if (Index >= d_sizeofsp) return;
 
     SPoint sp = sps[Index];
+    float spdf = 0.0;
+    pdf_device(sp, sp.wi, &spdf);
     /* if has continuous point on the path */
-    if(sp.pdf > 0.0 && sp.nidx > 0){
-        float inv_pdf = 1.0 / (sp.pdf * sp.rrpdf);
+    if(spdf > 0.0 && sp.nidx > 0){
+        float inv_pdf = 1.0 / (spdf * sp.rrpdf);
         float bsdf[3] = {0.0f};
-        bsdfeval_device(sp, sp.wi, bsdf);
+        bool t = false;
+        // if(Index == 2978795)
+        //     t = true;
+        bsdfeval_device(sp, sp.wi, bsdf, t);
         float rad[3] = {0.0f};
         mul3fand3f(temp_rad[Index+1].value, bsdf, rad);
         mul3fand1f(rad, inv_pdf, rad);
+        // if (Index == 2978795)
+        //     printf("\n nidx = %d, roughness = %.5f,\n, rad = [%.3f, %.3f, %.3f], \n temp = [%.3f, %.3f, %.3f], \n spdf = %.3f, sp.pdf = %.3f, sp.rrpdf = %.3f, inv_pdf = %.3f, bsdf = [%.3f, %.3f, %.3f]", 
+        //         sp.nidx, sp.roughness,
+                // rad[0], rad[1], rad[2], temp_rad[Index+1].value[0], temp_rad[Index+1].value[1], temp_rad[Index+1].value[2], spdf, sp.pdf, sp.rrpdf, inv_pdf, bsdf[0], bsdf[1], bsdf[2]);
         add3facumulate(radiance[Index].value, rad);
+        if(isnan(rad[0]) || isnan(rad[1]) || isnan(rad[2])){
+            printf("\n \n last run ISNAN*****************rad = [%.4f, %.4f, %.4f], incoming = [%.4f, %.4f, %.4f], ", rad[0], rad[1], rad[2], temp_rad[Index+1].value[0], temp_rad[Index+1].value[1], temp_rad[Index+1].value[2]);
+        }
+        
     }
     // add3facumulate(radiance[Index].value, sp.eLd);
 }
@@ -1405,6 +1461,16 @@ __global__ void allGPUPdfSum(const SPoint *sps, const int *neighbors, const int 
             }
         }
     }
+}
+
+__global__ void initializeHashTable(GridEntry * cu_hash_table){
+    int Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(Index >= d_num_clusters) return;
+
+    cu_hash_table[Index].index = -1;
+    cu_hash_table[Index].position[0] = 262144.0;
+    cu_hash_table[Index].position[1] = 262144.0;
+    cu_hash_table[Index].position[2] = 262144.0;
 }
 
 __global__ void allGPUPdfSumJitter(const SPoint *sps, const int *neighbors, const int *knn, float *pdfsum){
@@ -1603,6 +1669,17 @@ __global__ void allGPUPdfMarginalAndWeight(const SPoint *sps, const int *neighbo
     weightsum[Index] = ws;
 }
 
+__global__ void addtoSP(SPoint *cu_sps, const int *cu_clusters, const int *cu_clusters_offset){
+    int Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(Index >= d_num_clusters) return;
+    int pnum = getCellSize(cu_clusters_offset, Index, d_num_clusters, d_num_clusters_point);
+    int offset = cu_clusters_offset[Index];
+    for (int i = 0 ; i < pnum ; i++){
+        int idx = cu_clusters[offset+i];
+        cu_sps[idx].groupIdx = Index;
+    }
+}
+
 __global__ void allGPUDirectPdfMarginalAndWeight(const SPoint *sps, const LPoint * lps, const int *neighbors, const int *knn, float2 *pdfmarginal, float * weightsum, float * count, float *minweight){
     int Index = blockIdx.x * blockDim.x + threadIdx.x;
     if(Index >= d_sizeofsp) return;
@@ -1664,6 +1741,112 @@ __global__ void allGPUDirectPdfMarginal(const SPoint *sps, const LPoint * lps, c
         pdfmarginal[Index].x += lps[Index].lightpdf;
         pdfmarginal[Index].y += pdf_bsdf;
     }
+}
+
+__global__ void ClusterDirectPdfMarginal(const SPoint *sps, const LPoint * lps, const int *cu_clusters, const int *cu_cluster_offset, float2 *pdfmarginal){
+    int Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(Index >= d_sizeofsp) return;
+
+    SPoint spi = sps[Index];
+    int cluster_idx = spi.groupIdx;
+    if (cluster_idx != -1){
+        int k = getCellSize(cu_cluster_offset, cluster_idx, d_num_clusters, d_num_clusters_point);
+        int my_cluster_offset = cu_cluster_offset[cluster_idx];
+
+        for ( int i = 0 ; i < k ; i++){
+            int neighbor_idx = cu_clusters[my_cluster_offset+i];
+            SPoint spo = sps[neighbor_idx];
+            float light_bsdf_pdf = 0.0;
+            float bsdf_bsdf_pdf = 0.0;
+            pdf_device(spo, spi.wi, &bsdf_bsdf_pdf);
+            pdf_device(spo, spi.wi_d, &light_bsdf_pdf);
+            float cosh1 = dot(spi.wi, spo.shN);
+            float cosh2 = dot(spi.wi_d, spo.shN);
+            if(cosh2 > 0.0)
+                pdfmarginal[Index].x += lps[Index].lightpdf;
+            if(cosh1 > 0.0) 
+                pdfmarginal[Index].y += lps[Index].bsdfpdf;
+            pdfmarginal[Index].x += light_bsdf_pdf;
+            pdfmarginal[Index].y += bsdf_bsdf_pdf; // bsdf_light_pdf , bsdf_bsdf_pdf
+            // if(Index == 2978795){
+            //     printf(" Direct light light_bsdf_pdf = %.4f, bsdf_bsdf_pdf = %.4f, lightpdf = %.4f \n", light_bsdf_pdf, bsdf_bsdf_pdf, lps[Index].lightpdf);
+            // }
+        }
+    }else{
+        float light_bsdf_pdf = 0.0;
+        float bsdf_bsdf_pdf = 0.0;
+        pdf_device(spi, spi.wi, &bsdf_bsdf_pdf);
+        pdf_device(spi, spi.wi_d, &light_bsdf_pdf);
+        pdfmarginal[Index].x = lps[Index].lightpdf + light_bsdf_pdf;
+        pdfmarginal[Index].y = lps[Index].bsdfpdf + bsdf_bsdf_pdf;
+    }
+}
+
+
+__global__ void ClusterDirectRadiance(const SPoint *sps,  const LPoint *lps, const float2 *pdfmarginal, const int *cu_clusters, const int *cu_cluster_offset, val3f *radiance){
+    int Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (Index >= d_sizeofsp) return;
+
+    SPoint sp = sps[Index];
+    int cluster_idx = sp.groupIdx;
+    if (cluster_idx != -1){
+        int k = getCellSize(cu_cluster_offset, cluster_idx, d_num_clusters, d_num_clusters_point);
+        int my_offset = cu_cluster_offset[cluster_idx];
+
+        float inv_lightpdfmarginal = 1.0 / pdfmarginal[Index].x;
+        float inv_bsdfpdfmarginal = 1.0 / pdfmarginal[Index].y;
+        // float inv_pdfmarginal = 1.0 / (pdfmarginal[Index].x + pdfmarginal[Index].y);
+
+        for ( int i = 0 ; i < k ; i++){
+            int index = cu_clusters[my_offset + i];
+            SPoint spo = sps[index];
+            float finalradiance[3] = {0.0};
+            if( pdfmarginal[Index].x > 0.0){
+                float bsdf[3] = {0.0f};
+                float rad[3] = {0.0f};
+                bool t = false;
+                // if(index == 2978795 && Index == 1903118) t = true;
+                bsdfeval_device(spo, sp.wi_d, bsdf, t);
+                // float light_bsdf_pdf = 0.0;
+                // pdf_device(spo, sp.wi_d, &light_bsdf_pdf);
+                // float weight_light_sample = light_bsdf_pdf * inv_lightpdfmarginal;
+                mul3fand3f(lps[Index].L_directsample, bsdf, rad);
+                mul3fand1f(rad, inv_lightpdfmarginal, rad);
+                // mul3fand1f(rad, inv_pdfmarginal, rad);
+                add3f(finalradiance, rad, finalradiance);
+                // if (index == 2978795){
+                //     printf("%d, direct sample: bsdf = [%.4f, %.4f, %.4f], lps = [%.4f, %.4f, %.4f], inv_pdf = %.4f\n finalradiance = [%.4f, %.4f, %.4f] \n", Index,
+                //     bsdf[0], bsdf[1], bsdf[2], lps[Index].L_directsample[0], lps[Index].L_directsample[1], lps[Index].L_directsample[2], inv_lightpdfmarginal, finalradiance[0], finalradiance[1], finalradiance[2]);
+                // }
+            }
+            if( pdfmarginal[Index].y > 0.0){
+                float bsdf[3] = {0.0f};
+                float rad[3] = {0.0f};
+                bsdfeval_device(spo, sp.wi, bsdf);
+                mul3fand3f(lps[Index].L_bsdfsample, bsdf, rad);
+                mul3fand1f(rad, inv_bsdfpdfmarginal, rad);
+                // mul3fand1f(rad, inv_pdfmarginal, rad);
+                add3f(finalradiance, rad, finalradiance);
+                // if (index == 2978795){
+                //     printf("%d, bsdf sample: bsdf = [%.4f, %.4f, %.4f], lps = [%.4f, %.4f, %.4f], invpdf = %.4f\n", Index,
+                //     bsdf[0], bsdf[1], bsdf[2], lps[Index].L_bsdfsample[0], lps[Index].L_bsdfsample[1], lps[Index].L_bsdfsample[2], inv_bsdfpdfmarginal);
+                // }
+            }
+
+            atomicAdd(radiance[index].value, finalradiance[0]);
+            atomicAdd(radiance[index].value+1, finalradiance[1]);
+            atomicAdd(radiance[index].value+2, finalradiance[2]);
+            // if (index == 2978795){
+            //     printf("final radiance = [%.4f, %.4f, %.4f]\n",
+            //     finalradiance[0], finalradiance[1], finalradiance[2]);
+            // }
+        }
+    }else{
+        atomicAdd(radiance[Index].value, sp.eLd[0]);
+        atomicAdd(radiance[Index].value+1, sp.eLd[1]);
+        atomicAdd(radiance[Index].value+2, sp.eLd[2]);
+    }
+    
 }
 
 /* pdf of sampling wi at given shading point */
@@ -1735,7 +1918,7 @@ __global__ void bsdfeval(SPoint *sps, val3f * result){
 
     float dotWoH = dot(sp.wo, wh);
     float dotWiH = dot(sp.wi, wh);
-    float F = fresnelDielectricExt(dotWoH);
+    float F = fresnelDielectricExt(dotWoH, 1.5);
     float G = smithG1(dotWoH, dotWoShN, sp.roughness) * smithG1(dotWiH, dotWiShN, sp.roughness);
 
     float specularconst = F * G * D / (4.0f * dotWoShN);
@@ -1761,6 +1944,33 @@ __global__ void computeRadiance(const SPoint *sps, const val3f *bsdf, const floa
     }else zero3f(radiance[Index].value); 
 }
 
+__global__ void clampDirectCluster(const SPoint *sps, const LPoint *lps, val3f *cu_cluster_out, val3f * cu_cluster_in, const val3f *radiance){
+    int Index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(Index >= d_sizeofsp) return;
+
+    SPoint sp = sps[Index];
+    int idx = sp.groupIdx;
+    
+    if(idx == -1) return;
+
+    // if(Index == 2978795) {
+    //     printf(" Index = 2978795 , group idx = %d \n ============ \n", idx);
+    //     d_debug_cluster_idx = idx;
+    // }
+
+    atomicAdd(cu_cluster_in[idx].value, lps[Index].L_directsample[0]);
+    atomicAdd(cu_cluster_in[idx].value+1, lps[Index].L_directsample[1]);
+    atomicAdd(cu_cluster_in[idx].value+2, lps[Index].L_directsample[2]);
+
+    atomicAdd(cu_cluster_in[idx].value, lps[Index].L_bsdfsample[0]);
+    atomicAdd(cu_cluster_in[idx].value+1, lps[Index].L_bsdfsample[1]);
+    atomicAdd(cu_cluster_in[idx].value+2, lps[Index].L_bsdfsample[2]);
+
+    atomicAdd(cu_cluster_out[idx].value, radiance[Index].value[0]);
+    atomicAdd(cu_cluster_out[idx].value+1, radiance[Index].value[1]);
+    atomicAdd(cu_cluster_out[idx].value+2, radiance[Index].value[2]);
+}
+
 __global__ void clampCluster(const SPoint *sps, val3f *cu_cluster_out, val3f * cu_cluster_in, const val3f *radiance, const val3f *temp_radiance){
     int Index = blockIdx.x * blockDim.x + threadIdx.x;
     if(Index >= d_sizeofsp) return;
@@ -1775,7 +1985,6 @@ __global__ void clampCluster(const SPoint *sps, val3f *cu_cluster_out, val3f * c
         atomicAdd(cu_cluster_in[idx].value+1, temp_radiance[Index+1].value[1]);
         atomicAdd(cu_cluster_in[idx].value+2, temp_radiance[Index+1].value[2]);
     }
-
     atomicAdd(cu_cluster_out[idx].value, radiance[Index].value[0]);
     atomicAdd(cu_cluster_out[idx].value+1, radiance[Index].value[1]);
     atomicAdd(cu_cluster_out[idx].value+2, radiance[Index].value[2]);
@@ -1793,14 +2002,19 @@ __global__ void computeRatio(const SPoint *sps, const val3f *cu_cluster_out, con
 
     if(in_rad.value[0] < out_rad.value[0]){
         cu_ratio[Index].value[0] = in_rad.value[0] / out_rad.value[0];
+        
     }
     
     if(in_rad.value[1] < out_rad.value[1]){
         cu_ratio[Index].value[1] = in_rad.value[1] / out_rad.value[1];
     }
-    
+
+    // if (Index == d_debug_cluster_idx) printf("\n red = %.3f, red out = %.3f", in_rad.value[0], out_rad.value[0]);
+    // if (Index == d_debug_cluster_idx) printf("\n green = %.3f, green out = %.3f", in_rad.value[1], out_rad.value[1]);
+    // if (Index == d_debug_cluster_idx) printf("\n blue = %.3f, blue out = %.3f", in_rad.value[2], out_rad.value[2]);
+
     if(in_rad.value[2] < out_rad.value[2]){
-        cu_ratio[Index].value[2] = in_rad.value[2] / out_rad.value[2];
+        cu_ratio[Index].value[2] = in_rad.value[2] / out_rad.value[2];    
     }
 }
 
@@ -1810,7 +2024,7 @@ __global__ void updateComputeCluster(const SPoint *sps, val3f *radiance, const v
     SPoint sp = sps[Index];
     int idx = sp.groupIdx;
     if (idx != -1){
-        mul3fand3f(radiance[idx].value, cu_cluster_ratio[idx].value, radiance[idx].value);
+        mul3fand3f(radiance[Index].value, cu_cluster_ratio[idx].value, radiance[Index].value);
     }
     
 }
@@ -1830,6 +2044,8 @@ __global__ void updateWithOptDirectRadiance(const val3f * cu_direct_radiance, va
     int Index = blockIdx.x * blockDim.x + threadIdx.x;
     if(Index >= d_sizeofsp) return;
     add3f(cu_direct_radiance[Index].value, cu_radiance[Index].value, cu_tempRadiance[Index].value);
+    // if(Index == 2978795) 
+    //     printf("radiance = [%.4f, %.4f, %.4f]", cu_radiance[Index].value[0], cu_radiance[Index].value[1], cu_radiance[Index].value[2]);
 }
 
 __global__ void computeScatterRadiance(const SPoint *sps, const int *neIdx,const float *pdf_marginal, const val3f *radiance, val3f *ret){
@@ -1855,6 +2071,15 @@ __global__ void computeScatterRadiance(const SPoint *sps, const int *neIdx,const
 __global__ void clampRadiance(val3f *ret){
     int Index = blockIdx.x * blockDim.x + threadIdx.x;
     if(Index >= d_sizeofsp) return;
+
+    // if(Index == 2978795)
+    //     printf("radiance = [%.4f, %.4f, %.4f]\n", ret[Index].value[0], ret[Index].value[1], ret[Index].value[2]);
+
+    if(isnan(ret[Index].value[0]) || isnan(ret[Index].value[1]), isnan(ret[Index].value[2]))
+        printf("==========IS NAN %d, [%.4f, %.4f, %.4f] ===========", Index, ret[Index].value[0], ret[Index].value[1], ret[Index].value[2]);
+
+    // if ( abs(ret[Index].value[0] - 318) < 1 && abs(ret[Index].value[1] - 271 < 1) && abs(ret[Index].value[1] - 196) < 1 )
+    //     printf("Index = %d, radiance = [%.4f, %.4f, %.4f]\n", Index, ret[Index].value[0], ret[Index].value[1], ret[Index].value[2]);
 
     // for (int i = 0 ; i < 3 ; i++){
     //     if(ret[Index].value[i] > 10.0)
@@ -2016,6 +2241,54 @@ void computeDirectScatterAllOnGPU(const SPoint *cu_sps,const LPoint *cu_lps, con
 
     CUDAdelete(cu_directpdfmarginal);
 }
+
+
+
+void ClusterDirect(const SPoint *cu_sps,const LPoint *cu_lps, const int *cu_clusters, const int *cu_clusters_offset, int sizeofsp, int num_of_clusters, val3f * cu_direct_radiance){
+    std::cout<<"starting computing direct radiance!"<<std::endl;
+    int blocknum = sizeofsp / THREADDIM + 1;
+    size_t directpdfmarginal_size_in_byte = sizeofsp * sizeof(float2);
+    size_t radiance_size_in_byte = sizeofsp * sizeof(val3f);
+    float2 *cu_directpdfmarginal;
+    
+    /*copy constant to symbol*/
+    cudaMemcpyToSymbol(d_sizeofsp, &sizeofsp, sizeof(int));
+
+    /*compute direct marginal pdf sum*/
+    CUDAmalloc((void **)&cu_directpdfmarginal, directpdfmarginal_size_in_byte);
+    cudaMemset((void *)cu_directpdfmarginal, 0, directpdfmarginal_size_in_byte);
+    ClusterDirectPdfMarginal<<<blocknum, THREADDIM>>>(cu_sps, cu_lps, cu_clusters, cu_clusters_offset, cu_directpdfmarginal);
+    cudaDeviceSynchronize();
+
+    cudaMemset((void *)cu_direct_radiance, 0, radiance_size_in_byte);
+    ClusterDirectRadiance<<<blocknum, THREADDIM>>>(cu_sps,  cu_lps, cu_directpdfmarginal, cu_clusters, cu_clusters_offset, cu_direct_radiance);
+    cudaDeviceSynchronize();
+    
+    val3f *cu_cluster_out, *cu_cluster_in, *cu_cluster_ratio; 
+    CUDAmalloc((void **)&cu_cluster_out, sizeof(val3f) * num_of_clusters);
+    CUDAmalloc((void **)&cu_cluster_in, sizeof(val3f) * num_of_clusters);
+    CUDAmalloc((void **)&cu_cluster_ratio, sizeof(val3f) * num_of_clusters);
+    cudaMemset((void *)cu_cluster_out, 0, sizeof(val3f) * num_of_clusters);
+    cudaMemset((void *)cu_cluster_in, 0, sizeof(val3f) * num_of_clusters);
+    cudaMemset((void *)cu_cluster_ratio, 0, sizeof(val3f) * num_of_clusters);
+
+    int blocknum2 = num_of_clusters / THREADDIM + 1;
+
+    clampDirectCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_lps, cu_cluster_out, cu_cluster_in, cu_direct_radiance);
+    cudaDeviceSynchronize();
+    computeRatio<<<blocknum2, THREADDIM>>>(cu_sps, cu_cluster_out, cu_cluster_in, cu_cluster_ratio);
+    cudaDeviceSynchronize();
+    updateComputeCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_direct_radiance, cu_cluster_ratio);
+    cudaDeviceSynchronize();
+    addEmitterToDirectLight<<<blocknum, THREADDIM>>>(cu_lps, cu_direct_radiance);
+    cudaDeviceSynchronize();
+
+    CUDAdelete(cu_directpdfmarginal);
+    CUDAdelete(cu_cluster_out);
+    CUDAdelete(cu_cluster_in);
+    CUDAdelete(cu_cluster_ratio);
+}
+
 
 void computeDirectScatterAllOnGPUWithWeight(const SPoint *cu_sps,const LPoint *cu_lps, const int *cu_neighbors, const int *cu_dknn, int sizeofsp, int k, val3f * cu_direct_radiance, const size_t pitch_n){
     std::cout<<"starting computing scattering radiance!"<<std::endl;
@@ -2523,7 +2796,7 @@ void computeMISAllOnGPURecord(const SPoint *cu_sps, const int * cu_neighbors, co
         clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
         cudaDeviceSynchronize();
         CUDAcpyD2H((void *)cu_radiance, (void *)ret.blur_results[i], size_radiance_in_byte);
-        updateRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance, i);
+        updateRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance, i+1);
         cudaDeviceSynchronize();
         cudaMemset((void *)cu_radiance, 0, size_radiance_in_byte);
         lastRun<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance);
@@ -2599,7 +2872,87 @@ void computeMISAllOnGPU(const SPoint *cu_sps, const int * cu_neighbors, const in
     cudaFree(cu_radiance);
 }
 
-void computeClusterScatterAllOnGPURecord(const SPoint *cu_sps, int numClusters, const int *cu_clusters, const int *cu_cluster_offset, int sizeofsp, int iterations, int k, ResultSpace &ret){
+
+
+void ClusterScatterRecord(SPoint *cu_sps, int numClusters, const int *cu_clusters, 
+    int *cu_np_in_clusters, int sizeofsp, int iterations, ResultSpace &ret){
+    // std::cout<<"starting computing scattering radiance!"<<std::endl;
+    size_t marginalpdf_size_in_byte = sizeofsp * sizeof(float);
+    size_t radiance_size_in_byte = sizeofsp * sizeof(val3f);
+    float *cu_pdfmarginal;
+    val3f *cu_tempRadiance, *cu_radiance;    
+    cudaMalloc((void **)&cu_pdfmarginal, marginalpdf_size_in_byte);
+
+    thrust::device_ptr<int> dptr_cu_offsets(cu_np_in_clusters);
+    int numclusterpoint = dptr_cu_offsets[numClusters-1];
+    thrust::exclusive_scan(thrust::device, dptr_cu_offsets, numClusters + dptr_cu_offsets, dptr_cu_offsets);
+    numclusterpoint = dptr_cu_offsets[numClusters-1] + numclusterpoint;
+
+    // std::cout<<" num clusters "<<numclusterpoint<<std::endl;
+    
+    /*copy constant to symbol*/
+    cudaMemcpyToSymbol(d_sizeofsp, &sizeofsp, sizeof(int));
+    cudaMemcpyToSymbol(d_num_clusters, &numClusters, sizeof(int));
+    cudaMemcpyToSymbol(d_num_clusters_point, &numclusterpoint, sizeof(int));
+
+    /*compute marginal pdf sum*/
+    int blocknum = sizeofsp / THREADDIM + 1;
+    int blocknum2 = numClusters / THREADDIM + 1;
+    addtoSP<<<blocknum2, THREADDIM>>>(cu_sps, cu_clusters, cu_np_in_clusters);
+
+
+    cudaMemset((void *)cu_pdfmarginal, 0, marginalpdf_size_in_byte);
+    allGPUClusterPdfMarginal<<<blocknum, THREADDIM>>>(cu_sps, cu_clusters, cu_np_in_clusters, cu_pdfmarginal);
+    cudaDeviceSynchronize();
+    
+    /*Allocate and initialize*/
+    CUDAmalloc((void **)&cu_radiance, radiance_size_in_byte);
+    CUDAmalloc((void **)&cu_tempRadiance, radiance_size_in_byte);
+    cudaMemset((void *)cu_radiance, 0, radiance_size_in_byte);
+    cudaMemset((void *)cu_tempRadiance, 0, radiance_size_in_byte);
+
+    int i=0;
+    val3f *cu_cluster_out, *cu_cluster_in, *cu_cluster_ratio; 
+    CUDAmalloc((void **)&cu_cluster_out, sizeof(val3f) * numClusters);
+    CUDAmalloc((void **)&cu_cluster_in, sizeof(val3f) * numClusters);
+    CUDAmalloc((void **)&cu_cluster_ratio, sizeof(val3f) * numClusters);
+    cudaMemset((void *)cu_cluster_out, 0, sizeof(val3f) * numClusters);
+    cudaMemset((void *)cu_cluster_in, 0, sizeof(val3f) * numClusters);
+    cudaMemset((void *)cu_cluster_ratio, 0, sizeof(val3f) * numClusters);
+
+    updateRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance, i);
+    for (; i < iterations ; i++){
+        cudaMemset((void *)cu_radiance, 0, radiance_size_in_byte);
+        allGPUClusterScatterRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_pdfmarginal, cu_clusters, cu_np_in_clusters, cu_tempRadiance, cu_radiance);
+        cudaDeviceSynchronize();
+        clampCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_cluster_out, cu_cluster_in, cu_radiance, cu_tempRadiance);
+        cudaDeviceSynchronize();
+        computeRatio<<<blocknum2, THREADDIM>>>(cu_sps, cu_cluster_out, cu_cluster_in, cu_cluster_ratio);
+        cudaDeviceSynchronize();
+        updateComputeCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_radiance, cu_cluster_ratio);
+        cudaDeviceSynchronize();
+        clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
+        cudaDeviceSynchronize();
+        CUDAcpyD2H((void *)cu_radiance, (void *)ret.blur_results[i], radiance_size_in_byte);
+        cudaDeviceSynchronize();
+        updateRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance, i+1);
+        cudaDeviceSynchronize();
+        cudaMemset((void *)cu_radiance, 0, radiance_size_in_byte);
+        lastRun<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance);
+        cudaDeviceSynchronize();
+        clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
+        cudaDeviceSynchronize();
+        CUDAcpyD2H((void *)cu_radiance, (void *)ret.mc_results[i], radiance_size_in_byte);
+    }
+    cudaFree(cu_radiance);
+    cudaFree(cu_tempRadiance);
+    cudaFree(cu_pdfmarginal);
+    cudaFree(cu_cluster_out);
+    cudaFree(cu_cluster_in);
+}
+
+
+void computeClusterScatterAllOnGPURecord(const SPoint *cu_sps, int numClusters, const int *cu_clusters, const int *cu_cluster_offset, int sizeofsp, int iterations, ResultSpace &ret){
     std::cout<<"starting computing scattering radiance!"<<std::endl;
     size_t marginalpdf_size_in_byte = sizeofsp * sizeof(float);
     size_t radiance_size_in_byte = sizeofsp * sizeof(val3f);
@@ -2608,9 +2961,7 @@ void computeClusterScatterAllOnGPURecord(const SPoint *cu_sps, int numClusters, 
     cudaMalloc((void **)&cu_pdfmarginal, marginalpdf_size_in_byte);
     
     /*copy constant to symbol*/
-    printf("the max k I use: %d\n", k);
     cudaMemcpyToSymbol(d_sizeofsp, &sizeofsp, sizeof(int));
-    cudaMemcpyToSymbol(d_k, &k, sizeof(int));
     cudaMemcpyToSymbol(d_num_clusters, &numClusters, sizeof(int));
 
     /*compute marginal pdf sum*/
@@ -2646,12 +2997,16 @@ void computeClusterScatterAllOnGPURecord(const SPoint *cu_sps, int numClusters, 
         cudaDeviceSynchronize();
         updateComputeCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_radiance, cu_cluster_ratio);
         cudaDeviceSynchronize();
+        clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
+        cudaDeviceSynchronize();
         CUDAcpyD2H((void *)cu_radiance, (void *)ret.blur_results[i], radiance_size_in_byte);
         cudaDeviceSynchronize();
         updateRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance, i+1);
         cudaDeviceSynchronize();
         cudaMemset((void *)cu_radiance, 0, radiance_size_in_byte);
         lastRun<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance);
+        cudaDeviceSynchronize();
+        clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
         cudaDeviceSynchronize();
         CUDAcpyD2H((void *)cu_radiance, (void *)ret.mc_results[i], radiance_size_in_byte);
     }
@@ -2697,8 +3052,8 @@ void buildHashGridAndFindKNN(SPoint *cu_sps, hparam hp, int *cu_neighbors, int s
     HashGridSize<<<blocknum, THREADDIM>>>(cu_sps, cu_hash_offset);
     cudaDeviceSynchronize();
     CUDAcpyD2H(cu_hash_offset, data, grid_int_size_in_byte);
-    printf("\ntest init! num of grid = %d\n", num_grid);
-    printf("\ntest init! %d\n", data[0]);
+    // printf("\ntest init! num of grid = %d\n", num_grid);
+    // printf("\ntest init! %d\n", data[0]);
     cudaFree(cu_hash_offset);
     int maxCPG = *std::max_element(data, data+num_grid);
     printf("\t [max] point per grid is :%d \n", maxCPG);
@@ -2727,13 +3082,13 @@ void buildHashGridAndFindKNN(SPoint *cu_sps, hparam hp, int *cu_neighbors, int s
 }
 
 int countMyClusters(SPoint *cu_sps, int sizeofsp, hparam hp, int numClusters, int *cu_clusters, int *cu_np_in_clusters, int *cu_num_small_clusters){
-    int *smallest;
-    CUDAmalloc((void **)&smallest, sizeof(int));
-    thrust::device_ptr<int> dptr_smallest(smallest);
+    // int *smallest;
+    // CUDAmalloc((void **)&smallest, sizeof(int));
+    // thrust::device_ptr<int> dptr_smallest(smallest);
 
-    int *largest;
-    CUDAmalloc((void **)&largest, sizeof(int));
-    thrust::device_ptr<int> dptr_largest(largest);
+    // int *largest;
+    // CUDAmalloc((void **)&largest, sizeof(int));
+    // thrust::device_ptr<int> dptr_largest(largest);
 
     cudaMemcpyToSymbol(d_num_clusters, &numClusters, sizeof(int));
 
@@ -2743,20 +3098,19 @@ int countMyClusters(SPoint *cu_sps, int sizeofsp, hparam hp, int numClusters, in
     // dptr_largest = thrust::max_element(dptr_cu_neighbors_offset, dptr_cu_neighbors_offset+numClusters);
     // std::cout<<"[buildBatchClusters] max point in cluster: "<<dptr_largest[0]<<" min "<<dptr_smallest[0]<<std::endl;
     thrust::exclusive_scan(thrust::device, dptr_cu_neighbors_offset, dptr_cu_neighbors_offset + numClusters, dptr_cu_neighbors_offset);
-    
+    int num_of_cluster_point = lastClusterSize + dptr_cu_neighbors_offset[numClusters-1];
     //subdivide
     int *cu_num_in_cell;
     CUDAmalloc((void **)&cu_num_in_cell, sizeof(int) * (numClusters+1));
     cudaMemset(cu_num_in_cell, 0, sizeof(int) * (numClusters+1));
-    cudaMemcpyToSymbol(d_last_cluster_size, &lastClusterSize, sizeof(int));
-    std::cout<<"last cluster size: "<<lastClusterSize;
+    cudaMemcpyToSymbol(d_num_clusters_point, &num_of_cluster_point, sizeof(int));
 
     int blocknum = sizeofsp / THREADDIM + 1;
     SaveClusters<<<blocknum, THREADDIM>>>(cu_sps, cu_np_in_clusters, cu_num_in_cell, cu_clusters);
-    
+    cudaDeviceSynchronize();
     int individuals;
     CUDAcpyD2H(cu_num_in_cell + numClusters, &individuals, sizeof(int));
-    std::cout<<"\n number of individual points: "<<individuals<<std::endl;
+    // std::cout<<"\n number of individual points: "<<individuals<<std::endl;
     cudaMemcpyToSymbol(d_individual, &individuals, sizeof(int));
 
     // subdivide once
@@ -2767,9 +3121,8 @@ int countMyClusters(SPoint *cu_sps, int sizeofsp, hparam hp, int numClusters, in
     thrust::device_ptr<int> dptr_num_small_clusters(cu_num_small_clusters);
     int lastSmallClusters = dptr_num_small_clusters[numClusters-1];
     thrust::exclusive_scan(thrust::device, dptr_num_small_clusters, dptr_num_small_clusters + numClusters, dptr_num_small_clusters);
-    
     int newNumClusters = dptr_num_small_clusters[numClusters-1] + lastSmallClusters;
-    std::cout<<"\n number of old clusters"<<numClusters<<" number of new clusters: "<<newNumClusters<<" last element: "<<lastSmallClusters<<std::endl;
+    // std::cout<<"\n number of old clusters"<<numClusters<<" number of new clusters: "<<newNumClusters<<" last element: "<<lastSmallClusters<<std::endl;
     return newNumClusters;
 }
 
@@ -2811,27 +3164,27 @@ void subClusters(SPoint *cu_sps,
     // thrust::exclusive_scan(thrust::device, dptr_cu_num_point_new_cluster, dptr_cu_num_point_new_cluster+numNewClusters, dptr_cu_num_point_new_cluster); 
 }
 
-void FinalizeCluster(SPoint *cu_sps, int sizeofsp, hparam hp, int numClusters, int *cu_clusters, int *cu_np_in_clusters, int *cu_num_small_clusters){
+void FinalizeCluster(SPoint *cu_sps, int sizeofsp, hparam hp, int numClusters, int *cu_clusters, int *cu_np_in_clusters){
     cudaMemcpyToSymbol(d_num_clusters, &numClusters, sizeof(int));
 
     thrust::device_ptr<int> dptr_cu_neighbors_offset(cu_np_in_clusters);
     int lastClusterSize = dptr_cu_neighbors_offset[numClusters-1];
-    std::cout<<"last cluster size: "<<lastClusterSize;
+    // std::cout<<"last cluster size: "<<lastClusterSize;
 
     thrust::exclusive_scan(thrust::device, dptr_cu_neighbors_offset, dptr_cu_neighbors_offset + numClusters, dptr_cu_neighbors_offset);
- 
-    int *cu_num_in_cell;
-    CUDAmalloc((void **)&cu_num_in_cell, sizeof(int) * (numClusters+1));
-    cudaMemset(cu_num_in_cell, 0, sizeof(int) * (numClusters+1));
-    cudaMemcpyToSymbol(d_last_cluster_size, &lastClusterSize, sizeof(int));
-    int blocknum = sizeofsp / THREADDIM + 1;
-    SaveClusters<<<blocknum, THREADDIM>>>(cu_sps, cu_np_in_clusters, cu_num_in_cell, cu_clusters);
-    // get number of clusters that only has 1 points
-    int individuals;
-    CUDAcpyD2H(cu_num_in_cell + numClusters, &individuals, sizeof(int));
-    std::cout<<"\n number of individual points: "<<individuals<<std::endl;
-    cudaMemcpyToSymbol(d_individual, &individuals, sizeof(int));
+    int numclusterpoint = lastClusterSize + dptr_cu_neighbors_offset[numClusters-1];
 
+    int *cu_num_in_cell;
+    cudaMemcpyToSymbol(d_num_clusters_point, &numclusterpoint, sizeof(int));
+    int blocknum = sizeofsp / THREADDIM + 1;
+    cudaMalloc((void **)&cu_num_in_cell, sizeof(int) * numClusters);
+    cudaMemset(cu_num_in_cell, 0, sizeof(int) * numClusters);
+    SaveClusters<<<blocknum, THREADDIM>>>(cu_sps, cu_np_in_clusters, cu_num_in_cell, cu_clusters);
+    cudaDeviceSynchronize();
+    // int blocknum2 = numClusters / THREADDIM + 1;
+    // std::cout<<"checking clusters ... "<<std::endl;
+    // CheckClusters<<<blocknum2, THREADDIM>>>(cu_np_in_clusters, cu_num_in_cell);
+    // get number of clusters that only has 1 points
     CUDAdelete(cu_num_in_cell);
 }
 
@@ -2842,6 +3195,7 @@ size_t MatrixElementsNumber(SPoint *cu_sps, const int *cu_offset, const int num_
     int blocknum = sizeofsp / THREADDIM + 1;
     cudaMemset(cu_elements_offset, 0, sizeof(size_t) * sizeofsp);
     CountNoneZeroElements<<<blocknum, THREADDIM>>>(cu_sps, cu_offset, cu_elements_offset);
+    cudaDeviceSynchronize();
     thrust::device_ptr<size_t> dptr_cu_numberofNeighbor(cu_elements_offset);
     lastpointneighbor = dptr_cu_numberofNeighbor[sizeofsp-1];
     thrust::exclusive_scan(thrust::device, dptr_cu_numberofNeighbor, dptr_cu_numberofNeighbor+sizeofsp, dptr_cu_numberofNeighbor);
@@ -2875,6 +3229,7 @@ void ClusterIterations(SPoint *cu_sps, const int *cu_clusters, const int *cu_clu
     cudaMemset((void *)cu_cluster_ratio, 0, sizeof(val3f) * num_of_clusters);
 
     updateRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance, i);
+    cudaDeviceSynchronize();
     for (; i < iterations ; i++){
         cudaMemset((void *)cu_radiance, 0, sizeof(val3f) * sizeofsp);
         MX<<<blocknum, THREADDIM>>>(cu_sps, cu_clusters, cu_elements, cu_cluster_offset, cu_element_offset, cu_tempRadiance, cu_radiance);
@@ -2885,6 +3240,8 @@ void ClusterIterations(SPoint *cu_sps, const int *cu_clusters, const int *cu_clu
         cudaDeviceSynchronize();
         updateComputeCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_radiance, cu_cluster_ratio);
         cudaDeviceSynchronize();
+        clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
+        cudaDeviceSynchronize();
         CUDAcpyD2H((void *)cu_radiance, (void *)ret.blur_results[i], sizeof(val3f) * sizeofsp);
         cudaDeviceSynchronize();
         updateRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance, i+1);
@@ -2892,8 +3249,128 @@ void ClusterIterations(SPoint *cu_sps, const int *cu_clusters, const int *cu_clu
         cudaMemset((void *)cu_radiance, 0, sizeof(val3f) * sizeofsp);
         lastRun<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance);
         cudaDeviceSynchronize();
+        clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
+        cudaDeviceSynchronize();
         CUDAcpyD2H((void *)cu_radiance, (void *)ret.mc_results[i], sizeof(val3f) * sizeofsp);
     }
+
+    cudaFree(cu_radiance);
+    cudaFree(cu_tempRadiance);
+    cudaFree(cu_cluster_ratio);
+    cudaFree(cu_cluster_out);
+    cudaFree(cu_cluster_in);
+}
+
+void ClusterIterations2(SPoint *cu_sps, const int *cu_clusters, const int *cu_cluster_offset, const int num_of_clusters, const size_t *cu_element_offset, 
+    int sizeofsp, const val3f * cu_elements,const val3f * cu_direct_radiance, int iterations, ResultSpace &ret){
+        val3f *cu_tempRadiance, *cu_radiance;    
+    
+    cudaMemcpyToSymbol(d_sizeofsp, &sizeofsp, sizeof(int));
+    cudaMemcpyToSymbol(d_num_clusters, &num_of_clusters, sizeof(int));
+
+    /*compute marginal pdf sum*/
+    int blocknum = sizeofsp / THREADDIM + 1;
+    int blocknum2 = num_of_clusters / THREADDIM + 1; 
+    /*Allocate and initialize*/
+    CUDAmalloc((void **)&cu_radiance, sizeof(val3f) * sizeofsp);
+    CUDAmalloc((void **)&cu_tempRadiance, sizeof(val3f) * sizeofsp);
+    cudaMemset((void *)cu_radiance, 0, sizeof(val3f) * sizeofsp);
+    cudaMemset((void *)cu_tempRadiance, 0, sizeof(val3f) * sizeofsp);
+
+    int i=0;
+    val3f *cu_cluster_out, *cu_cluster_in, *cu_cluster_ratio; 
+    CUDAmalloc((void **)&cu_cluster_out, sizeof(val3f) * num_of_clusters);
+    CUDAmalloc((void **)&cu_cluster_in, sizeof(val3f) * num_of_clusters);
+    CUDAmalloc((void **)&cu_cluster_ratio, sizeof(val3f) * num_of_clusters);
+    cudaMemset((void *)cu_cluster_out, 0, sizeof(val3f) * num_of_clusters);
+    cudaMemset((void *)cu_cluster_in, 0, sizeof(val3f) * num_of_clusters);
+    cudaMemset((void *)cu_cluster_ratio, 0, sizeof(val3f) * num_of_clusters);
+
+    updateRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance, i);
+    cudaDeviceSynchronize();
+    for (; i < iterations ; i++){
+        cudaMemset((void *)cu_radiance, 0, sizeof(val3f) * sizeofsp);
+        MX<<<blocknum, THREADDIM>>>(cu_sps, cu_clusters, cu_elements, cu_cluster_offset, cu_element_offset, cu_tempRadiance, cu_radiance);
+        cudaDeviceSynchronize();
+        clampCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_cluster_out, cu_cluster_in, cu_radiance, cu_tempRadiance);
+        cudaDeviceSynchronize();
+        computeRatio<<<blocknum2, THREADDIM>>>(cu_sps, cu_cluster_out, cu_cluster_in, cu_cluster_ratio);
+        cudaDeviceSynchronize();
+        updateComputeCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_radiance, cu_cluster_ratio);
+        cudaDeviceSynchronize();
+        clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
+        cudaDeviceSynchronize();
+        CUDAcpyD2H((void *)cu_radiance, (void *)ret.blur_results[i], sizeof(val3f) * sizeofsp);
+        // cudaDeviceSynchronize();
+        updateWithOptDirectRadiance<<<blocknum, THREADDIM>>>(cu_direct_radiance, cu_tempRadiance, cu_radiance);
+        cudaDeviceSynchronize();
+        cudaMemset((void *)cu_radiance, 0, sizeof(val3f) * sizeofsp);
+        lastRun<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance);
+        cudaDeviceSynchronize();
+        clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
+        cudaDeviceSynchronize();
+        CUDAcpyD2H((void *)cu_radiance, (void *)ret.mc_results[i], sizeof(val3f) * sizeofsp);
+    }
+
+    cudaFree(cu_radiance);
+    cudaFree(cu_tempRadiance);
+    cudaFree(cu_cluster_ratio);
+    cudaFree(cu_cluster_out);
+    cudaFree(cu_cluster_in);
+}
+
+void ClusterIterations3(SPoint *cu_sps, const int *cu_clusters, const int *cu_cluster_offset, const int num_of_clusters, const size_t *cu_element_offset, 
+    int sizeofsp, const val3f * cu_elements,const val3f * cu_direct_radiance, int iterations, ResultSpace &ret){
+        val3f *cu_tempRadiance, *cu_radiance;    
+    
+    cudaMemcpyToSymbol(d_sizeofsp, &sizeofsp, sizeof(int));
+    cudaMemcpyToSymbol(d_num_clusters, &num_of_clusters, sizeof(int));
+
+    /*compute marginal pdf sum*/
+    int blocknum = sizeofsp / THREADDIM + 1;
+    int blocknum2 = num_of_clusters / THREADDIM + 1; 
+    /*Allocate and initialize*/
+    CUDAmalloc((void **)&cu_radiance, sizeof(val3f) * sizeofsp);
+    CUDAmalloc((void **)&cu_tempRadiance, sizeof(val3f) * sizeofsp);
+    cudaMemset((void *)cu_radiance, 0, sizeof(val3f) * sizeofsp);
+    cudaMemset((void *)cu_tempRadiance, 0, sizeof(val3f) * sizeofsp);
+
+    int i=0;
+    val3f *cu_cluster_out, *cu_cluster_in, *cu_cluster_ratio; 
+    CUDAmalloc((void **)&cu_cluster_out, sizeof(val3f) * num_of_clusters);
+    CUDAmalloc((void **)&cu_cluster_in, sizeof(val3f) * num_of_clusters);
+    CUDAmalloc((void **)&cu_cluster_ratio, sizeof(val3f) * num_of_clusters);
+    cudaMemset((void *)cu_cluster_out, 0, sizeof(val3f) * num_of_clusters);
+    cudaMemset((void *)cu_cluster_in, 0, sizeof(val3f) * num_of_clusters);
+    cudaMemset((void *)cu_cluster_ratio, 0, sizeof(val3f) * num_of_clusters);
+
+    updateRadiance<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance, i);
+    cudaDeviceSynchronize();
+    for (; i < iterations ; i++){
+        cudaMemset((void *)cu_radiance, 0, sizeof(val3f) * sizeofsp);
+        MX<<<blocknum, THREADDIM>>>(cu_sps, cu_clusters, cu_elements, cu_cluster_offset, cu_element_offset, cu_tempRadiance, cu_radiance);
+        cudaDeviceSynchronize();
+        clampCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_cluster_out, cu_cluster_in, cu_radiance, cu_tempRadiance);
+        cudaDeviceSynchronize();
+        computeRatio<<<blocknum2, THREADDIM>>>(cu_sps, cu_cluster_out, cu_cluster_in, cu_cluster_ratio);
+        cudaDeviceSynchronize();
+        updateComputeCluster<<<blocknum, THREADDIM>>>(cu_sps, cu_radiance, cu_cluster_ratio);
+        cudaDeviceSynchronize();
+        clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
+        cudaDeviceSynchronize();
+        if(i == iterations-1){
+            CUDAcpyD2H((void *)cu_radiance, (void *)ret.blur_results[i], sizeof(val3f) * sizeofsp);
+        }else{
+            updateWithOptDirectRadiance<<<blocknum, THREADDIM>>>(cu_direct_radiance, cu_tempRadiance, cu_radiance);
+        }
+        cudaDeviceSynchronize();        
+    }
+    cudaMemset((void *)cu_radiance, 0, sizeof(val3f) * sizeofsp);
+    lastRun<<<blocknum, THREADDIM>>>(cu_sps, cu_tempRadiance, cu_radiance);
+    cudaDeviceSynchronize();
+    clampRadiance<<<blocknum, THREADDIM>>>(cu_radiance);
+    cudaDeviceSynchronize();
+    CUDAcpyD2H((void *)cu_radiance, (void *)ret.mc_results[iterations-1], sizeof(val3f) * sizeofsp);
 
     cudaFree(cu_radiance);
     cudaFree(cu_tempRadiance);
@@ -2922,17 +3399,9 @@ void precomputedMatrixElemtns(SPoint *cu_sps, const int *cu_clusters, const int 
     cudaFree(cu_pdfmarginal);
 }
 
-void buildBatchClusters(SPoint *cu_sps, int sizeofsp, int *cu_hash_table_sizes, int tablecells, hparam hp, int numClusters, int * indices, int *cu_clusters, int *cu_np_in_clusters){
-    // generate length of N vector l
-    // random shuffle vector l
-    // int *cu_hash_table_sizes;
-
-    int *cu_clusters_idx;
-    std::cout<<std::endl;
-    for (int i = 0 ; i < 20 ; i++){
-        std::cout<<indices[i]<<" ";
-    }
-
+void buildBatchClusters(SPoint *cu_sps, int sizeofsp, int tablecells, hparam hp, int numClusters, int * indices, int *cu_clusters, int *cu_np_in_clusters){
+    int *cu_clusters_idx, *cu_hash_table_sizes;
+    CUDAmalloc((void **)&cu_hash_table_sizes, sizeof(int) * tablecells);
     CUDAmalloc((void **)&cu_clusters_idx, sizeof(int) * numClusters);
     CUDAcpyH2D(cu_clusters_idx, indices, sizeof(int) * numClusters);
 
@@ -2946,6 +3415,8 @@ void buildBatchClusters(SPoint *cu_sps, int sizeofsp, int *cu_hash_table_sizes, 
         0
     };
 
+    float dist = sqrtf(hp.cellsize[0] * hp.cellsize[0] + hp.cellsize[1] * hp.cellsize[1] + hp.cellsize[2] * hp.cellsize[2]) * 2.0;
+    cudaMemcpyToSymbol(d_min_dist, &dist, sizeof(float));
     cudaMemcpyToSymbol(d_params, (void *)&kp, sizeof(KPara));
     cudaMemcpyToSymbol(d_sizeofsp, &sizeofsp, sizeof(int));
 
@@ -2967,38 +3438,38 @@ void buildBatchClusters(SPoint *cu_sps, int sizeofsp, int *cu_hash_table_sizes, 
     // thrust::device_ptr<int> dptr_largest(largest);
 
     int lasttablesize = dptr_hash_table_offsets[tablecells-1];
-    std::cout<<"[buildBatchClusters] last hash table cell size: "<<lasttablesize<<std::endl;
+    // std::cout<<"[buildBatchClusters] last hash table cell size: "<<lasttablesize<<std::endl;
     // dptr_smallest = thrust::min_element(dptr_hash_table_offsets, dptr_hash_table_offsets+tablecells);
     // dptr_largest = thrust::max_element(dptr_hash_table_offsets, dptr_hash_table_offsets+tablecells);
     // std::cout<<"[buildBatchClusters] max: "<<dptr_largest[0]<<" min "<<dptr_smallest[0]<<std::endl;
 
     thrust::exclusive_scan(thrust::device, dptr_hash_table_offsets, dptr_hash_table_offsets+tablecells, dptr_hash_table_offsets);
     int lastoffset =  dptr_hash_table_offsets[tablecells-1];
-    std::cout<<"[buildBatchClusters] largest offset: "<<lastoffset<<std::endl;
+    // std::cout<<"[buildBatchClusters] largest offset: "<<lastoffset<<"hash table size: "<<lastoffset+lasttablesize<<"clusters "<<numClusters<<std::endl;
     
     GridEntry *cu_hash_table;
     int *cu_num_in_cell;
     CUDAmalloc((void **)&cu_num_in_cell, sizeof(int) * tablecells);
-    std::cout<<"cu_num_in_cell "<<std::endl;
     CUDAmalloc((void **)&cu_hash_table, sizeof(GridEntry) * numClusters);
-    std::cout<<"cu_hash_table "<<std::endl;
+    // blocknum = tablecells / THREADDIM + 1;
+    // initializeHashTable<<<blocknum, THREADDIM>>>(cu_hash_table);
+
     cudaMemset(cu_num_in_cell, 0, sizeof(int) * tablecells);
     blocknum = numClusters / THREADDIM + 1;
     buildHashSub<<<blocknum, THREADDIM>>>(cu_sps, cu_clusters_idx, cu_hash_table_sizes, cu_num_in_cell, cu_hash_table);
     cudaDeviceSynchronize();
-    std::cout<<"buildHashSub "<<std::endl;
     cudaFree(cu_num_in_cell);
     
     // find nearest point from K
     blocknum = sizeofsp / THREADDIM + 1;
-    std::cout<<"cu_neighbors_offset "<<std::endl;
     cudaMemset(cu_np_in_clusters, 0, sizeof(int) * numClusters);
-
     Cluster<<<blocknum, THREADDIM>>>(cu_sps, cu_hash_table_sizes, cu_hash_table, cu_np_in_clusters);
     cudaDeviceSynchronize();
-
+    
     // [ validated ] =================================================================
     CUDAdelete(cu_clusters_idx);
+    CUDAdelete(cu_hash_table);
+    CUDAdelete(cu_hash_table_sizes);
 }
 
 

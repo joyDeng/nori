@@ -187,8 +187,8 @@ void computeScatterAllOnGPUWithDirectOptandWeight(const SPoint *cu_sps,const int
     int sizeofsp, int iterations, int k,  int dk, val3f * cu_direct_radiance, ResultSpace ret, const size_t pitch, bool jitter=false);
 void computeScatterAllOnGPURecordWithDirectOptandWeight(const SPoint *cu_sps,const int *cu_neighbors, const int *cu_knn, int sizeofsp, int iterations, int k, val3f * cu_direct_radiance, ResultSpace ret, const size_t pitch);
 /*with direct light opt cluster haven't check whether its working*/
-void computeClusterScatterAllOnGPURecord(const SPoint *cu_sps, int numClusters, const int *cu_clusters, const int *cu_cluster_offset, int sizeofsp, int iterations, int k, ResultSpace &ret);
-void buildBatchClusters(SPoint *cu_sps, int sizeofsp, int *cu_hash_table_sizes, int tablecells, hparam hp, int numClusters, int * indices, int *cu_clusters, int *cu_np_in_clusters);
+void computeClusterScatterAllOnGPURecord(const SPoint *cu_sps, int numClusters, const int *cu_clusters, const int *cu_cluster_offset, int sizeofsp, int iterations, ResultSpace &ret);
+void buildBatchClusters(SPoint *cu_sps, int sizeofsp, int tablecells, hparam hp, int numClusters, int * indices, int *cu_clusters, int *cu_np_in_clusters);
 int countMyClusters(SPoint *cu_sps, int sizeofsp, hparam hp, int numClusters, int *cu_clusters, int *cu_np_in_clusters, int *cu_num_small_clusters);
 void subClusters(SPoint *cu_sps, 
                 int sizeofsp, 
@@ -200,11 +200,18 @@ void subClusters(SPoint *cu_sps,
                 int *cu_num_point_new_cluster,
                 int *cu_num_small_clusters
                 );
-void FinalizeCluster(SPoint *cu_sps, int sizeofsp, hparam hp, int numClusters, int *cu_clusters, int *cu_np_in_clusters, int *cu_num_small_clusters);                
+void FinalizeCluster(SPoint *cu_sps, int sizeofsp, hparam hp, int numClusters, int *cu_clusters, int *cu_np_in_clusters);                
 void ClusterIterations(SPoint *cu_sps, const int *cu_clusters, const int *cu_cluster_offset, const int num_of_clusters, const size_t *cu_element_offset, 
     int sizeofsp, const val3f * cu_elements, int iterations, ResultSpace &ret);
+void ClusterIterations2(SPoint *cu_sps, const int *cu_clusters, const int *cu_cluster_offset, const int num_of_clusters, const size_t *cu_element_offset, 
+    int sizeofsp, const val3f * cu_elements,const val3f * cu_direct, int iterations, ResultSpace &ret);
+void ClusterIterations3(SPoint *cu_sps, const int *cu_clusters, const int *cu_cluster_offset, const int num_of_clusters, const size_t *cu_element_offset, 
+    int sizeofsp, const val3f * cu_elements,const val3f * cu_direct_radiance, int iterations, ResultSpace &ret);
 void precomputedMatrixElemtns(SPoint *cu_sps, const int *cu_clusters, const int *cu_cluster_offset, const size_t *cu_element_offset, const int num_of_clusters, const int sizeofsp, const int numzeroelemetns, val3f *cu_matrix_elements);
 size_t MatrixElementsNumber(SPoint *cu_sps, const int *cu_offset, const int num_of_clusters, size_t * cu_elements_offset, int sizeofsp);
+void ClusterDirect(const SPoint *cu_sps,const LPoint *cu_lps, const int *cu_clusters, const int *cu_clusters_offset, int sizeofsp, int num_of_clusters, val3f * cu_direct_radiance);
+void ClusterScatterRecord(SPoint *cu_sps, int numClusters, const int *cu_clusters, 
+    int *cu_np_in_clusters, int sizeofsp, int iterations, ResultSpace &ret);
 
 class SPoints{
 private:
@@ -238,11 +245,15 @@ public:
     /* data */
     SPoint * h_sps;
     LPoint * h_lps;
+    int *h_clusters_offset;
+    int *h_clusters;
     int num;
     int knn;
     int dknn;
     int maxK;
     int numberOfClusters;
+    int numberOfPoints;
+    bool hashostclusters = false;
     // int *h_clusters;
     Neighborhood m_neighbors;
     bool gpuMemAllocated = false;
@@ -327,6 +338,13 @@ public:
         std::cout<<"allocating "<<size_in_byte<<" bytes to "<<N<<" shading points"<<std::endl;
         h_sps = (SPoint *)malloc(size_in_byte);
         h_lps = (LPoint *)malloc(size_in_lbyte);
+        return true;
+    }
+
+    bool allocateNeighrbos(int cluster_num, int cluster_points_num){
+        h_clusters = (int *)malloc(cluster_points_num * sizeof(int));
+        h_clusters_offset = (int *)malloc(cluster_num * sizeof(int));
+        hashostclusters = true;
         return true;
     }
 
@@ -472,7 +490,7 @@ public:
         }
     }
 
-    void computeScatterRadianceAOGWithProcessRecording(int iteration){
+    void coteScatterRadianceAOGWithProcessRecording(int iteration){
         if (iteration != m_result.iter)
             allocateResultSpaceForNiteration(iteration);
 
@@ -519,7 +537,16 @@ public:
         std::cout<<"gpuMemAllocated: "<<gpuMemAllocated<<" gpuMemUploaded: "<<gpuMemUploaded<<" hasclusters: "<<hasclusters<<std::endl;
 
         if(gpuMemAllocated && gpuMemUploaded && hasclusters){
-            computeClusterScatterAllOnGPURecord(cu_sps, numberOfClusters, cu_clusters, cu_clusters_offsets, num, iteration, maxK, m_result);
+            computeClusterScatterAllOnGPURecord(cu_sps, numberOfClusters, cu_clusters, cu_clusters_offsets, num, iteration, m_result);
+        }
+    }
+
+    void loadClusterScatter(int iteration){
+        if(iteration != m_result.iter)
+            allocateResultSpaceForNiteration(iteration);
+        
+        if(gpuMemAllocated && gpuMemUploaded && hasclusters){
+            ClusterScatterRecord(cu_sps, numberOfClusters, cu_clusters, cu_clusters_offsets, num, iteration, m_result);
         }
     }
 
@@ -531,7 +558,7 @@ public:
             size_t *cu_element_offset;
             CUDAmalloc((void **)&cu_element_offset, sizeof(size_t) * num);
             size_t num_of_element = MatrixElementsNumber(cu_sps, cu_clusters_offsets, numberOfClusters, cu_element_offset,num);
-            std::cout<<"number of element "<<num_of_element<<std::endl;
+            // std::cout<<"number of element "<<num_of_element<<std::endl;
             val3f *cu_matrix_elements;
             CUDAmalloc((void **)&cu_matrix_elements, sizeof(val3f) * num_of_element);
             std::cout<<"allocating "<<sizeof(val3f) * num_of_element / (float)(1024.0 * 1024.0)<<" mb "<<std::endl;
@@ -542,24 +569,89 @@ public:
         }
     }
 
+    void ClusterScatterWithDirectOpt(int iteration){
+         if (iteration != m_result.iter)
+            allocateResultSpaceForNiteration(iteration);
+
+        if(gpuMemAllocated && gpuMemUploaded && hasclusters){
+            val3f * cu_direct_radiance;
+            CUDAmalloc((void **)&cu_direct_radiance, num * sizeof(val3f));
+            ClusterDirect(cu_sps, cu_lps, cu_clusters, cu_clusters_offsets, num, numberOfClusters, cu_direct_radiance);
+
+            size_t *cu_element_offset;
+            CUDAmalloc((void **)&cu_element_offset, sizeof(size_t) * num);
+            size_t num_of_element = MatrixElementsNumber(cu_sps, cu_clusters_offsets, numberOfClusters, cu_element_offset,num);
+            // std::cout<<"number of element "<<num_of_element<<std::endl;
+            val3f *cu_matrix_elements;
+            CUDAmalloc((void **)&cu_matrix_elements, sizeof(val3f) * num_of_element);
+            std::cout<<"allocating "<<sizeof(val3f) * num_of_element / (float)(1024.0 * 1024.0)<<" mb "<<std::endl;
+            precomputedMatrixElemtns(cu_sps, cu_clusters, cu_clusters_offsets, cu_element_offset, numberOfClusters, num, num_of_element, cu_matrix_elements);
+            ClusterIterations2(cu_sps, cu_clusters, cu_clusters_offsets, numberOfClusters, cu_element_offset, num, cu_matrix_elements, cu_direct_radiance, iteration, m_result);
+            CUDAcpyD2H((void *)cu_direct_radiance, m_result.blur_direct, num * sizeof(val3f));
+
+            CUDAdelete(cu_matrix_elements);
+            CUDAdelete(cu_element_offset);
+            CUDAdelete(cu_direct_radiance);
+        }
+    }
+
+    void ClusterScatterWithDirectOptNR(int iteration){
+         if (iteration != m_result.iter)
+            allocateResultSpaceForNiteration(iteration);
+
+        if(gpuMemAllocated && gpuMemUploaded && hasclusters){
+            val3f * cu_direct_radiance;
+            CUDAmalloc((void **)&cu_direct_radiance, num * sizeof(val3f));
+            ClusterDirect(cu_sps, cu_lps, cu_clusters, cu_clusters_offsets, num, numberOfClusters, cu_direct_radiance);
+
+            size_t *cu_element_offset;
+            CUDAmalloc((void **)&cu_element_offset, sizeof(size_t) * num);
+            size_t num_of_element = MatrixElementsNumber(cu_sps, cu_clusters_offsets, numberOfClusters, cu_element_offset,num);
+            // std::cout<<"number of element "<<num_of_element<<std::endl;
+            val3f *cu_matrix_elements;
+            CUDAmalloc((void **)&cu_matrix_elements, sizeof(val3f) * num_of_element);
+            std::cout<<"allocating "<<sizeof(val3f) * num_of_element / (float)(1024.0 * 1024.0)<<" mb "<<std::endl;
+            precomputedMatrixElemtns(cu_sps, cu_clusters, cu_clusters_offsets, cu_element_offset, numberOfClusters, num, num_of_element, cu_matrix_elements);
+            ClusterIterations3(cu_sps, cu_clusters, cu_clusters_offsets, numberOfClusters, cu_element_offset, num, cu_matrix_elements, cu_direct_radiance, iteration, m_result);
+            CUDAcpyD2H((void *)cu_direct_radiance, m_result.blur_direct, num * sizeof(val3f));
+
+            CUDAdelete(cu_matrix_elements);
+            CUDAdelete(cu_element_offset);
+            CUDAdelete(cu_direct_radiance);
+        }
+    }
+
+    void loadClusters(int K){
+        CUDAmalloc((void **)&cu_clusters_offsets, sizeof(int) * numberOfClusters);
+        CUDAcpyH2D(cu_clusters_offsets, h_clusters_offset, sizeof(int) * numberOfClusters);
+
+        CUDAmalloc((void **)&cu_clusters, sizeof(int) * numberOfPoints);
+        CUDAcpyH2D(cu_clusters,h_clusters, sizeof(int) * numberOfPoints);
+        std::cout<<" numberOfPoints = "<<numberOfPoints<<" num = "<<num<<std::endl;
+        maxK = K;
+        hasclusters = true;
+    }
+
     void BuildClusters(int K){
         std::vector<int> v(num);
-        std::cout<<std::endl;
+        // std::cout<<std::endl;
         std::generate(v.begin(), v.end(), [n=0]()mutable{return n++;});
-         for (int i = 0 ; i < 20 ; i++){
-            std::cout<<v[i]<<" ";
-        }
-        std::random_device rd;
-        std::mt19937 g(rd());
-        std::shuffle(v.begin(), v.end(), g);
-        std::cout<<std::endl;
-        for (int i = 0 ; i < 20 ; i++){
-            std::cout<<v[i]<<" ";
-        }
-        std::cout<<std::endl;
+        // for (int i = 0 ; i < 20 ; i++){
+        //     std::cout<<v[i]<<" ";
+        // }
+        // std::random_device rd;
+        // std::mt19937 g(rd());
+        std::srand(1994);
+        std::random_shuffle(v.begin(), v.end());
+        // std::random_shuffle(v.begin(), v.end());
+        // std::cout<<std::endl;
+        // for (int i = 0 ; i < 20 ; i++){
+        //     std::cout<<v[i]<<" ";
+        // }
+        // std::cout<<std::endl;
         maxK = K;
 
-        float cellsize[3] = {(my_maxb[0] - my_minb[0]) / my_dim[0], (my_maxb[1] - my_minb[1]) / my_dim[1], (my_maxb[2] - my_minb[2]) / my_dim[2]};
+        float cellsize[3] = {(my_maxb[0] - my_minb[0]) / (float) my_dim[0], (my_maxb[1] - my_minb[1]) /  (float) my_dim[1], (my_maxb[2] - my_minb[2]) /  (float) my_dim[2]};
         
         hparam hp{
             {my_dim[0], my_dim[1], my_dim[2]}, 
@@ -571,28 +663,28 @@ public:
 
         int numClusters = num / K + 1;
         int tablecells = numClusters;
-        int *cu_np_points, *cu_table;
+        int *cu_np_points;
 
-        std::cout<<"num of total point: "<<num<<std::endl;
-        std::cout<<"num of cluster point: "<<numClusters<<std::endl;
-        std::cout<<"num of tablecells: "<<tablecells<<std::endl;
+        // std::cout<<"num of total point: "<<num<<std::endl;
+        // std::cout<<"num of cluster point: "<<numClusters<<std::endl;
+        // std::cout<<"num of tablecells: "<<tablecells<<std::endl;
 
         CUDAmalloc((void **)&cu_clusters, sizeof(int) * num);
         CUDAmalloc((void **)&cu_np_points, sizeof(int) * numClusters);
-        CUDAmalloc((void **)&cu_table, sizeof(int) * tablecells);
+        
 
-        buildBatchClusters(cu_sps, num, cu_table, tablecells, hp, numClusters, v.data(), cu_clusters, cu_np_points);
+        buildBatchClusters(cu_sps, num, tablecells, hp, numClusters, v.data(), cu_clusters, cu_np_points);
 
-        int *myclusters;
-        myclusters = (int*) malloc(sizeof(int) * numClusters);
-        CUDAcpyD2H(cu_np_points, myclusters, sizeof(int) * numClusters);
-        std::ofstream file2("/home/xd/Research/pathrenderer/scenes/kitchen/scene_clusters.bin", std::ios::out|std::ios::binary|std::ios::trunc);
-        if(file2.is_open()){
-            file2.seekp(0);
-            file2.write((char *)myclusters, sizeof(int) * numClusters);
-        }
-        file2.close();
-        delete[] myclusters;
+        // int *myclusters;
+        // myclusters = (int*) malloc(sizeof(int) * numClusters);
+        // CUDAcpyD2H(cu_np_points, myclusters, sizeof(int) * numClusters);
+        // std::ofstream file2("/home/xd/Research/pathrenderer/scenes/kitchen/scene_clusters.bin", std::ios::out|std::ios::binary|std::ios::trunc);
+        // if(file2.is_open()){
+        //     file2.seekp(0);
+        //     file2.write((char *)myclusters, sizeof(int) * numClusters);
+        // }
+        // file2.close();
+        // delete[] myclusters;
 
         int *cu_num_small_clusters;
         CUDAmalloc((void **)&cu_num_small_clusters, sizeof(int) * numClusters);
@@ -613,16 +705,16 @@ public:
         CUDAmalloc((void **)&cu_num_point_new_cluster, sizeof(int) * new_num_clusters); 
         subClusters(cu_sps, num, hp, numClusters, new_num_clusters, cu_clusters, cu_np_points, cu_num_point_new_cluster, cu_num_small_clusters);
 
-        int *mynewclusters1;
-        mynewclusters1 = (int*) malloc(sizeof(int) * new_num_clusters);
-        CUDAcpyD2H(cu_num_point_new_cluster, mynewclusters1, sizeof(int) * new_num_clusters);
-        std::ofstream file3("/home/xd/Research/pathrenderer/scenes/kitchen/scene_new_sub_clusters.bin", std::ios::out|std::ios::binary|std::ios::trunc);
-        if(file3.is_open()){
-            file3.seekp(0);
-            file3.write((char *)mynewclusters1, sizeof(int) * new_num_clusters);
-        }
-        file3.close();
-        delete[] mynewclusters1;
+        // int *mynewclusters1;
+        // mynewclusters1 = (int*) malloc(sizeof(int) * new_num_clusters);
+        // CUDAcpyD2H(cu_num_point_new_cluster, mynewclusters1, sizeof(int) * new_num_clusters);
+        // std::ofstream file3("/home/xd/Research/pathrenderer/scenes/kitchen/scene_new_sub_clusters.bin", std::ios::out|std::ios::binary|std::ios::trunc);
+        // if(file3.is_open()){
+        //     file3.seekp(0);
+        //     file3.write((char *)mynewclusters1, sizeof(int) * new_num_clusters);
+        // }
+        // file3.close();
+        // delete[] mynewclusters1;
 
         CUDAdelete(cu_num_small_clusters);
         CUDAmalloc((void **)&cu_num_small_clusters, sizeof(int) * new_num_clusters);
@@ -633,29 +725,53 @@ public:
         CUDAmalloc((void **)&cu_num_point_new_cluster2, sizeof(int) * new_num_clusters2); 
         subClusters(cu_sps, num, hp, new_num_clusters, new_num_clusters2, cu_clusters, cu_num_point_new_cluster, cu_num_point_new_cluster2, cu_num_small_clusters);
 
-        int *mynewclusters2;
-        mynewclusters2 = (int*) malloc(sizeof(int) * new_num_clusters2);
-        CUDAcpyD2H(cu_num_point_new_cluster2, mynewclusters2, sizeof(int) * new_num_clusters2);
-        std::ofstream file4("/home/xd/Research/pathrenderer/scenes/kitchen/scene_new_sub_clusters_2.bin", std::ios::out|std::ios::binary|std::ios::trunc);
-        if(file4.is_open()){
-            file4.seekp(0);
-            file4.write((char *)mynewclusters2, sizeof(int) * new_num_clusters2);
-        }
-        file4.close();
-        delete[] mynewclusters2;
+        // int *mynewclusters2;
+        // mynewclusters2 = (int*) malloc(sizeof(int) * new_num_clusters2);
+        // CUDAcpyD2H(cu_num_point_new_cluster2, mynewclusters2, sizeof(int) * new_num_clusters2);
+        // std::ofstream file3("/home/xd/Research/pathrenderer/scenes/veach-ajar/scene_new_sub_clusters_2.bin", std::ios::out|std::ios::binary|std::ios::trunc);
+        // if(file3.is_open()){
+        //     file3.seekp(0);
+        //     file3.write((char *)mynewclusters2, sizeof(int) * new_num_clusters2);
+        // }
+        // file3.close();
+        // delete[] mynewclusters2;
 
-        FinalizeCluster(cu_sps, num, hp, new_num_clusters2, cu_clusters, cu_num_point_new_cluster2, cu_num_small_clusters);
+        FinalizeCluster(cu_sps, num, hp, new_num_clusters2, cu_clusters, cu_num_point_new_cluster2);
+        // int *cu_num_in_cell;
+        // CUDAmalloc((void **)&cu_num_in_cell, sizeof(int) * (numClusters));
+        // FinalizeCluster(cu_sps, num, hp, numClusters, cu_clusters, cu_np_points, cu_num_in_cell);
+
+        numberOfClusters =  new_num_clusters2;
+        numberOfPoints = num;
 
         CUDAmalloc((void **)&cu_clusters_offsets, sizeof(int) * new_num_clusters2);
         CUDAmemD2D(cu_clusters_offsets, cu_num_point_new_cluster2, sizeof(int) * new_num_clusters2);
+        
+        // CUDAmalloc((void **)&cu_clusters_offsets, sizeof(int) * numberOfClusters);
+        // CUDAmemD2D(cu_clusters_offsets, cu_num_in_cell, sizeof(int) * numberOfClusters);
 
-        numberOfClusters = new_num_clusters2;
+        // int npp;
+        // CUDAcpyD2H(cu_clusters_offsets + new_num_clusters2 - 1, &npp, sizeof(int));
+        // std::cout<<"            MY CLUSTER POINTS          "<<npp<<"  V.S. "<<num<<std::endl;
+
+     
+
+        // int *mynewclusterscc;
+        // mynewclusterscc = (int*) malloc(sizeof(int) * num);
+        // CUDAcpyD2H(cu_clusters, mynewclusterscc, sizeof(int) * num);
+        // std::ofstream file4("/home/xd/Research/pathrenderer/scenes/veach-ajar/scene_new_sub_clusters_idx.bin", std::ios::out|std::ios::binary|std::ios::trunc);
+        // if(file4.is_open()){
+        //     file4.seekp(0);
+        //     file4.write((char *)mynewclusterscc, sizeof(int) * num);
+        // }
+        // file4.close();
+        // delete[] mynewclusterscc;
         
         hasclusters = true;
         CUDAdelete(cu_np_points);
-        CUDAdelete(cu_num_small_clusters);
-        CUDAdelete(cu_num_point_new_cluster);
-        CUDAdelete(cu_num_point_new_cluster2);
+        // CUDAdelete(cu_num_small_clusters);
+        // CUDAdelete(cu_num_point_new_cluster);
+        // CUDAdelete(cu_num_point_new_cluster2);
     }
 
     void BuildKNN(int K, int dK){
@@ -707,6 +823,11 @@ public:
             freeResultSpace();
         }
         std::cout<<"deconstruct SPoints 3"<<std::endl;
+        if(hashostclusters){
+            free(h_clusters);
+            free(h_clusters_offset);
+            hashostclusters = false;
+        }
     }
 
     SPoints(int N) {

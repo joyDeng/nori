@@ -25,6 +25,7 @@ typedef struct CompleteLightPath {
     int yIdx;
     size_t firstPathPointIdx;
     size_t numOfPathPoints;
+    Color3f em;
 } cPath;
 
 typedef struct aabbinfo {
@@ -53,6 +54,7 @@ class PathGraph {
     bool loadPaths(std::string foldername);
     bool loadAABB(std::string foldername);
     bool loadGraph(std::string foldername);
+    bool loadNeighbors(std::string foldername);
     void computeDimensions(AABBINFO aabb, const int N);
 
 

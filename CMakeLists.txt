@@ -10,6 +10,8 @@ add_subdirectory(ext ext_build)
 include(CheckLanguage)
 check_language(CUDA)
 
+#SET(CMAKE_BUILD_TYPE Debug)
+
 include_directories(
   # Nori include files
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -165,6 +167,7 @@ endif()
 #set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -lineinfo")
 
 #set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -stdlib=libstdc++ -lc++abi")
+
 
 target_compile_features(warptest PRIVATE cxx_std_17)
 target_compile_features(nori PRIVATE cxx_std_17)
