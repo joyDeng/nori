@@ -37,9 +37,9 @@ void writeIndirectLight(string filename, Vector2i size, const PathGraph *pg){
             float red = (ptr+pid)->value[0];
             float green = (ptr+pid)->value[1];
             float blue = (ptr+pid)->value[2];
-            if ( r == 1185 && c == 36 ){
-                std::cout<<"Index = "<<pid<<" x = "<<r<<" y = "<<c<<" number of point: "<<pg->m_cpl[j].numOfPathPoints<<std::endl;
-            }
+            // if ( r == 1185 && c == 36 ){
+            //     std::cout<<"Index = "<<pid<<" x = "<<r<<" y = "<<c<<" number of point: "<<pg->m_cpl[j].numOfPathPoints<<std::endl;
+            // }
                 
             iter_image(c, r) = Color3f(red, green, blue);
             
@@ -164,7 +164,7 @@ int main(int argc, char **argv){
 
     bool loaded = false;
     if(argc > 1){
-       foldername = "/home/xd/Research/pathrenderer/outputs/" + string(argv[1]);
+       foldername = "/home/xd/Research/pathrenderer/scenes/" + string(argv[1]);
         // foldername = "/media/xd/Data/data/outputs/" + string(argv[1]);
        filename = filename + foldername;
        loaded = pg.loadShadingPoints(foldername);
@@ -188,7 +188,7 @@ int main(int argc, char **argv){
             cout<<"iteration = "<<m_iteration<<endl;
         }else if (str.compare(string("-m")) == 0){
             m_mode = string(argv[i+1]);
-            cout<<"iteration = "<<m_mode<<endl;
+            cout<<"mode = "<<m_mode<<endl;
         }
     }
 
@@ -209,12 +209,12 @@ int main(int argc, char **argv){
         
         end = clock();
         double time_exe = double(end - start) / double(CLOCKS_PER_SEC);
-        cout<<"Time taken by building knn is: "<<fixed<<time_exe<<setprecision(5);
-        cout<<" sec "<<endl;
+        cout<<"Time taken by building cluster is: "<<fixed<<time_exe<<setprecision(5);
+         cout<<" sec "<<endl;
         start = clock();
         if (m_mode.compare("opt") == 0){
-            // pg.m_sps.ClusterScatterWithDirectOptNR(m_iteration);
-            pg.m_sps.ClusterScatterWithDirectOpt(m_iteration);
+            pg.m_sps.ClusterScatterWithDirectOptNR(m_iteration);
+            // pg.m_sps.ClusterScatterWithDirectOpt(m_iteration);
         }else if(m_mode.compare("n") == 0){
             pg.m_sps.ClusterScatter2(m_iteration);
         }else if(m_mode.compare("t") == 0){
@@ -248,7 +248,6 @@ int main(int argc, char **argv){
         //     string file = filename + "_k-" + to_string(m_k);
         //     writeProgressImage(file, pg.m_sps.m_result.blur_results[i],pg.m_sps.m_result.mc_results[i],i,Vector2i(width, height), &pg);
         // }
-
     }
 
     return 0;

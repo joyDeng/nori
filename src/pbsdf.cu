@@ -349,6 +349,63 @@ __device__ float distreval(float cosh, float roughness){
     return result;
 }
 
+
+
+__device__ void fresnelConductorExact(float* result, float cosThetaI, const float* eta, const float* k){
+    float cosThetaI2 = cosThetaI*cosThetaI, 
+          sinThetaI2 = 1-cosThetaI2,
+          sinThetaI4 = sinThetaI2*sinThetaI2;
+    
+    for (int i = 0 ; i < 3 ; i++){
+        float temp1 = eta[i] * eta[i] - k[i] * k[i] - sinThetaI2;
+        float a2pb2 = sqrt(temp1 * temp1 + k[i] * k[i] * eta[i] * eta[i] * 4.0);
+        float a = sqrt((a2pb2 + temp1) * 0.5f);
+
+        float term1 = a2pb2 + cosThetaI2;
+        float term2 = a * (2 * cosThetaI);
+
+        float Rs2 = (term1 - term2) / (term1 + term2);
+        float term3 = a2pb2*cosThetaI2 + sinThetaI4;
+        float term4 = term2*sinThetaI2;
+
+        float Rp2 = Rs2 * (term3 - term4) / (term3 + term4);
+        result[i] = 0.5f * (Rp2 + Rs2);
+    }
+}
+
+__device__ float fresnelDielectricExt2(float cosThetaI_, float *cosThetaT_, float ETA){
+    if(ETA == 1.0f){
+        *cosThetaT_ = -cosThetaI_;
+        return 0.0f;
+    }
+    
+    /* Using Snell's law, calculate the squared sine of the
+       angle between the normal and the transmitted ray */
+    float scale = (cosThetaI_ > 0.0) ? 1.0 / ETA : ETA;
+    float cosThetaTSqr = 1.0 - (1.0-cosThetaI_*cosThetaI_) * (scale*scale);
+
+    /* Check for total internal reflection */
+    if (cosThetaTSqr <= 0.0f){
+        *cosThetaT_ = 0.0f;
+        return 1.0f;
+    }
+        
+
+    /* Find the absolute cosines of the incident/transmitted rays */
+    float cosThetaI = abs(cosThetaI_);
+    float cosThetaT = sqrtf(cosThetaTSqr);
+
+    float Rs = (cosThetaI - ETA * cosThetaT)
+             / (cosThetaI + ETA * cosThetaT);
+    float Rp = (ETA * cosThetaI - cosThetaT)
+             / (ETA * cosThetaI + cosThetaT);
+
+    *cosThetaT_ = (cosThetaI_ > 0) ? -cosThetaT : cosThetaT;
+
+    /* No polarization -- return the unpolarized reflectance */
+    return 0.5f * (Rs * Rs + Rp * Rp);
+}
+
 __device__ float fresnelDielectricExt(float cosThetaI_, float ETA){
     /* Using Snell's law, calculate the squared sine of the
        angle between the normal and the transmitted ray */
@@ -390,14 +447,54 @@ __device__ float distrpdf(const float dotWoShN, const float dotWoH, const float 
     return  smithG1(dotWoH, dotWoShN, roughness) * abs(dotWoH) * distreval(dotWhShN, roughness) / abs(dotWoShN);
 }
 
+__device__ void reflect(float *ret, const float*dir){
+    for (int i = 0 ; i < 2; i++)
+        ret[i] = -dir[i];
+    ret[2] = dir[2];
+}
+
+__device__ void refract(float *ret, const float*wo, float costhetaT, float eta){
+    float scale = (-costhetaT < 0 ? 1.0 / eta : eta);
+    ret[0] = scale * wo[0];
+    ret[1] = scale * wo[1];
+    ret[2] = costhetaT;
+}
+
 /*bsdf evaluation given shading point and incoming light direction */
 __device__ void bsdfeval_device(const SPoint sp, const float *wi, float *bsdf, bool t=false){
-    
     float dotWiShN = dot(wi, sp.shN);
     float dotWigeoN = dot(wi, sp.geoN);
-    if( dotWigeoN  * dotWiShN <= 0.0) return;
     float dotWoGeoN = dot(sp.wo, sp.geoN);
     float dotWoShN = dot(sp.wo, sp.shN);
+
+    if(sp.bsdf_type == 't'){//dielectric
+        float cosThetaI = dotWoShN;
+        float cosThetaT_ = 0.0f;
+        float F =  fresnelDielectricExt2(cosThetaI, &cosThetaT_, sp.eta[0]);
+        if(dotWiShN * dotWoShN >= 0.0){
+            float dir[3] = {0.0};
+            reflect(dir, sp.wo);
+            printf("reflect agles %.4f\n", dot(dir, wi)-1.0f);
+            if(abs(dot(wi, dir)-1.0f) > 0.00001f)
+                return;
+            mul3fand1f(sp.specular , F, bsdf);
+        }else{
+            float dir[3] = {0.0};
+            refract(dir, sp.wo, cosThetaT_, sp.eta[0]);
+            printf("refract agles %.4f\n", dot(dir, wi)-1.0f);
+            if(abs(dot(dir, wi)-1.0f) > 0.00001f)
+                return;
+            float factor = (cosThetaT_ < 0.0 ? 1.0 / sp.eta[0] : sp.eta[0]);
+            // compute transimittance
+            printf("specular %.3f, %.3f, %.3f", sp.diffuse[0], sp.diffuse[1], sp.diffuse[2]);
+            mul3fand1f(sp.diffuse, factor * factor * (1.0-F), bsdf);
+        }
+        return;
+    }
+
+
+   
+    if( dotWigeoN  * dotWiShN <= 0.0) return;
     if( dotWiShN <= 0.0 || dotWoShN <= 0.0) return;
 
     float diffuseconst = M_1_PI * dotWiShN;
@@ -405,12 +502,12 @@ __device__ void bsdfeval_device(const SPoint sp, const float *wi, float *bsdf, b
     mul3fand1f(sp.diffuse, diffuseconst, diffuse);
 
     /* compute specular part */
-    if(sp.bsdf_type == 'd'){
+    if(sp.bsdf_type == 'd'){//diffuse
         
         bsdf[0] = diffuse[0];
         bsdf[1] = diffuse[1];
         bsdf[2] = diffuse[2];
-    }else{
+    }else if(sp.bsdf_type == 'o'){//opaque
         float wh[3];
         add3f(wi, sp.wo, wh);
         normalize(wh);
@@ -430,14 +527,34 @@ __device__ void bsdfeval_device(const SPoint sp, const float *wi, float *bsdf, b
         // float dotWoShN = dot(sp.shN, sp.wo);
         float T1221 = (1.0 - fresnelDielectricExt(dotWoShN, 1.5)) * (1.0 - fresnelDielectricExt(dotWiShN, 1.5));
         mul3fand1f(diffuse, T1221, diffuse);
-        if(t){
-            printf("T1221 = %.3f, F = %.5f, D = %.5f, G = %.5f, diffuse = [%.4f, %.4f, %.4f], cosh = %.9f\n", T1221, F, D, G, diffuse[0], diffuse[1], diffuse[2], dotWhShN);
-            printf("wh = [%.4f, %.4f, %.4f], shN = [%.4f, %.4f, %.4f]\n", wh[0], wh[1], wh[2], sp.shN[0], sp.shN[1], sp.shN[2]);
-            printf("wi = [%.4f, %.4f, %.4f], wo = [%.4f, %.4f, %.4f]\n", wi[0], wi[1], wi[2], sp.wo[0], sp.wo[1], sp.wo[2]);
-        }
+        // if(t){
+        //     printf("T1221 = %.3f, F = %.5f, D = %.5f, G = %.5f, diffuse = [%.4f, %.4f, %.4f], cosh = %.9f\n", T1221, F, D, G, diffuse[0], diffuse[1], diffuse[2], dotWhShN);
+        //     printf("wh = [%.4f, %.4f, %.4f], shN = [%.4f, %.4f, %.4f]\n", wh[0], wh[1], wh[2], sp.shN[0], sp.shN[1], sp.shN[2]);
+        //     printf("wi = [%.4f, %.4f, %.4f], wo = [%.4f, %.4f, %.4f]\n", wi[0], wi[1], wi[2], sp.wo[0], sp.wo[1], sp.wo[2]);
+        // }
 
         /*compute diffuse part*/
         add3f(diffuse, specular, bsdf);
+    }else if(sp.bsdf_type == 'c'){//rough conductor
+        float wh[3];
+        add3f(wi, sp.wo, wh);
+        normalize(wh);
+        float dotWhShN = dot(wh, sp.shN);
+        float D = distreval(dotWhShN, sp.roughness);
+        if(D == 0.0)
+            return; //bsdf = 0.0f
+        
+        float dotWoH = dot(sp.wo, wh);
+        float dotWiH = dot(wi, wh);
+        float G = smithG1(dotWoH, dotWoShN, sp.roughness) * smithG1(dotWiH, dotWiShN, sp.roughness);
+        float model = D * G / (4.0f * dotWoShN);
+        float F[3] = {1.0f};
+        float cosThetaI = dotWoH;
+        fresnelConductorExact(F, cosThetaI, sp.eta, sp.k);
+        // printf("eta = %f, %f, %f\n", sp.eta[0], sp.eta[1], sp.eta[2]);
+        // printf("k = %f, %f, %f\n", sp.k[0], sp.k[1], sp.k[2]);
+        mul3fand3f(F, sp.specular, F);
+        mul3fand1f(F, model, bsdf);
     }
 }
 
@@ -445,16 +562,41 @@ __device__ void bsdfeval_device(const SPoint sp, const float *wi, float *bsdf, b
 __device__ void pdf_device(const SPoint sp, const float *wi, float *pdf){
     float dotWiShN = dot(wi, sp.shN);
     float dotWigeoN = dot(wi, sp.geoN);
-    if( dotWigeoN  * dotWiShN <= 0.0) return;
     float dotWoGeoN = dot(sp.wo, sp.geoN);
     float dotWoShN = dot(sp.wo, sp.shN);
+    
+    if(sp.bsdf_type == 't'){//dielectric
+        float cosThetaI = dotWoShN;
+        float cosThetaT_;
+        float F =  fresnelDielectricExt2(cosThetaI, &cosThetaT_, sp.eta[0]);
+        if(dotWiShN * dotWoShN >= 0.0){
+            float dir[3] = {0.0f};
+            reflect(dir, sp.wo);
+            if(abs(dot(dir, wi) - 1.0f) > 0.00001f){
+                *pdf = 0.0f;
+                return;
+            }
+            *pdf = F;
+        }else{
+            float dir[3] = {0.0f};
+            refract(dir, sp.wo, cosThetaT_, sp.eta[0]);
+            if(abs(dot(dir, wi) - 1.0f) > 0.00001f){
+                *pdf = 0.0f;
+                return;
+            }
+            *pdf = 1.0 - F;
+        }
+        return;
+    }
+
+    if( dotWigeoN  * dotWiShN <= 0.0) return;
     if( dotWiShN <= 0.0 || dotWoShN <= 0.0) return;
 
     float diffuse = dotWiShN * M_1_PI;
     if(sp.bsdf_type == 'd'){
         // printf("is diffuse surface!");
         *pdf = diffuse;
-    }else{
+    }else if(sp.bsdf_type == 'o'){
         float pspecular = fresnelDielectricExt(dotWoShN, 1.5);
         float pdiffuse = fmaxf(fmaxf(sp.diffuse[0], sp.diffuse[1]), sp.diffuse[2]);
 
@@ -471,6 +613,17 @@ __device__ void pdf_device(const SPoint sp, const float *wi, float *pdf){
         float prob = distrpdf(dotWoShN, dotWoH, dotWhShN, sp.roughness);
         float specular = prob * inv_dWhWi * pspecular;
         *pdf = specular + diffuse * pdiffuse;
+    }else if(sp.bsdf_type == 'c'){
+        float wh[3];
+        add3f(wi, sp.wo, wh);
+        normalize(wh);
+        
+        float dotWhShN = dot(wh, sp.shN);
+        float dotWiH = dot(wi, wh);
+        float dotWoH = dot(sp.wo, wh);
+        float inv_whwi = 1.0 / (4.0 * dotWiH);
+        float prob = distrpdf(dotWoShN, dotWoH, dotWhShN, sp.roughness);
+        *pdf = prob * inv_whwi;
     }
 }
 

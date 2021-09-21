@@ -133,6 +133,8 @@ struct ShadingPoint{
     float specular[3];
     float eLi[3];
     float eLd[3];
+    float eta[3];
+    float k[3];
     float roughness;
     float pdf;
     float rrpdf;

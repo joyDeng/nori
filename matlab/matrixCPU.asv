@@ -1,0 +1,218 @@
+jdxfileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_matrixJdx.bin');
+idxfileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_matrixIdx.bin');
+
+ARfileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_matrix_r.bin');
+AGfileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_matrix_g.bin');
+ABfileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_matrix_b.bin');
+
+xinitfileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_matrix_x_0_value.bin')
+
+bfileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_matrix_b_value.bin')
+
+infofileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_matrix_info.bin')
+clusterfileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_clusters.bin')
+pidxfileID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_matrix_pixel_idx.bin')
+imginfoID = fopen('/home/xd/Research/pathrenderer/scenes/living-room-2/scene_img_info.bin')
+
+eigenvfilename = "/home/xd/Research/pathrenderer/scenes/living-room-2/scene_eigenv_complex.jpg";
+
+
+
+IDX = fread(idxfileID, 'int32');
+JDX = fread(jdxfileID, 'int32');
+PDX = fread(pidxfileID, 'int32');
+clusters = fread(clusterfileID, 'int32');
+
+Ar = fread(ARfileID, 'float');
+Ag = fread(AGfileID, 'float');
+Ab = fread(ABfileID, 'float');
+
+X = fread(xinitfileID, 'float');
+b = fread(bfileID, 'float');
+
+X = reshape(X, 3, []);
+b = reshape(b, 3, []);
+
+
+dimension = fread(infofileID, 'int32');
+wandh = fread(imginfoID, 'int32');
+
+IDX = IDX + 1;
+JDX = JDX + 1;
+
+R = PAmat(IDX, JDX, Ar, dimension);
+G = PAmat(IDX, JDX, Ag, dimension);
+B = PAmat(IDX, JDX, Ab, dimension);
+
+disp(size(b));
+disp(dimension);
+outputname = "/home/xd/Research/pathrenderer/scenes/living-room-2/scene_iter_";
+IterAndSaveRGB(outputname, R,G,B, b, X, PDX, 120, wandh(1), wandh(2));
+
+str_n = sprintf('%s_eigenvalues.jpg', outputname);
+eigen_vectors = saveComplexEigenValues(R, 3, str_n);
+
+saveEigenValues(outputname, eigen_vectors, PDX, wandh(1), wandh(2));
+writeEigenvalues2File(outputname, eigen_vectors)
+
+function w = writeEigenvalues2File(outputname, ev)
+    sizes = size(ev);
+    for c = 1:sizes(2)
+        str_n = sprintf('%s_ev_%02d.bin', outputname, c);
+        fileID = fopen(str_n, 'w');
+        fwrite(fileID, ev(:,c));
+        fclose(fileID);
+    end
+end
+
+% saveImg(outputname, output, PDX, wandh(1), wandh(2));
+function pv = getValues(data, idx, mask)
+    pv = data(idx);
+    pv(mask) = 0.0;
+end
+
+function output = saveImgRGB(filename, xr, xg, xb, pdx, width, height)
+    mask = (pdx == -2);
+    pixel_idx = pdx + 1;
+    pixel_idx(mask) = 1;
+
+    r = getValues(xr, pixel_idx, mask);
+    g = getValues(xg, pixel_idx, mask);
+    b = getValues(xb, pixel_idx, mask);
+
+    mywriteHDR(r, g, b, width, height, filename);
+    output = true;
+end
+
+
+
+function output = IterAndSaveRGB(filename, R, G, B, b, x, pdx, N, width, height)
+    xr = x(1, :).';
+    xg = x(2, :).';
+    xb = x(3, :).';
+    br = b(1, :).';
+    bg = b(2, :).';
+    bb = b(3, :).';
+    disp(length(br));
+    for c = 1:N
+        str_f = sprintf('%s_%02d.hdr',filename, c);
+        xr = Jacobian(R, xr, br);
+        xg = Jacobian(G, xg, bg);
+        xb = Jacobian(B, xb, bb);
+        saveImgRGB(str_f, xr, xg, xb, pdx, width, height);
+    end
+end
+
+function output = saveImg(filename, data, pdx, width, height)
+    mask = (pdx == -2);
+    pixel_idx = pdx + 1;
+    pixel_idx(mask) = 1;
+
+    pixels = data(pixel_idx);
+    pixels(mask) = 0;
+
+    mywriteHDR(pixels, pixels, pixels, width, height, filename);
+    output = true;
+end
+
+function a = saveEigenValues(filename, vectors, pid, w, h)
+    sizes = size(vectors);
+    disp(sizes);
+    col = sizes(2);
+    disp(col);
+    for id = 1:col
+        fs = sprintf("%s_eigen_vectors_%02d.hdr", filename, id);
+        disp(id);
+        data = vectors(:,id);
+        saveImg(fs, abs(data), pid, w, h);
+    end
+    a = true;
+end
+
+function output = IterAndSave(filename, A, b, x, pdx, N, width, height)
+    for c = 1:N
+        str_f = sprintf('%s_%02d.hdr',filename, c);
+        x = Jacobian(A, x, b);
+        saveImg(str_f, x, pdx, width, height);
+    end
+end
+
+
+function  t = saveComplexEigenValues(matrixR, dim, filename)
+    [vector_R_V, eigenv_R_D] = eigs(matrixR, dim);
+    eigenv = diag(eigenv_R_D);
+    real_eigenvs = real(eigenv);
+    image_eigenvs = imag(eigenv);
+    fig = figure('visible', 'off');
+    plot(real_eigenvs, image_eigenvs, 'r+');
+    xlabel('real');
+    ylabel('imag');
+     
+    saveas(fig, filename);
+    close(fig);
+    t = vector_R_V
+end
+
+function output = Iter(N, A, x, b)
+    for c = 1:N
+        x = Jacobian(A, x, b);
+    end
+    output = x;
+end
+
+function x1 = Jacobian(A, x, b)
+    x1 = A * x + b;
+end
+
+function A = Amat(id,jd, values, dimension)
+    A = speye(dimension) - sparse(id, jd, values, dimension, dimension);
+end
+
+function PA = PAmat(id,jd, values, dimension)
+    PA = sparse(id, jd, values, dimension, dimension);
+end
+
+function f = mywriteHDR(r, g, b, w, h, filename)
+    R = reshape(r, h, w, 1);
+    G = reshape(g, h, w, 1);
+    B = reshape(b, h, w, 1);
+    img = cat(3, R, G, B);
+   hdrwrite(img, filename);
+end
+
+function pixl = pixelValue(values, mask, ppid)
+    pixl = values(ppid);
+    pixl(mask) = 0.0;
+end
+
+function a = truncNegative(b)
+    a = b;
+    mask = b < 0;
+    a(mask) = 0;
+end
+
+function b = storeAllEigen(eR, eG, eB, w, h, msk, folder, pdx)
+    for c = 1:length(eR)
+        filename = sprintf('%s_%03d.hdr', folder, c);
+        plotname = sprintf('%s_plot_%03d.png', folder, c);
+
+        rff = eR(:,c);
+        gff = eG(:,c);
+        bff = eB(:,c);
+
+        fig = figure('visible', 'off');
+         
+        t2 = 1:length(bff);
+        plot(t2, rff, t2, gff, t2, bff);
+        legend({'Red', 'Green', 'Blue'},'Location','northeast');
+        saveas(fig, plotname);
+
+        close(fig)
+
+        r = pixelValue(rff, msk, pdx);
+        g = pixelValue(gff, msk, pdx);
+        b = pixelValue(bff, msk, pdx);
+
+        mywriteHDR(r, g, b, w, h, filename)
+    end
+end
